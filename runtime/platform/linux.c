@@ -232,6 +232,7 @@ static int ov_find(const OvSet *o, uint64_t a) {
     }
     return -1;
 }
+static __thread const ucontext_t *ov_fault_uc;  // (the signal context of the fault being handled: XCDE_OVERLAP_WHO)
 static bool ov_fault(uint64_t fa, bool write) {
     const OvSet *c = __atomic_load_n(&ov_cur, __ATOMIC_ACQUIRE), *p = __atomic_load_n(&ov_prev, __ATOMIC_ACQUIRE), *o = NULL;
     int r = -1;
@@ -250,6 +251,20 @@ static bool ov_fault(uint64_t fa, bool write) {
         while (done() < o->seq) sched_yield();  // (no wait function, or it gave up)
         __atomic_add_fetch(&ov_waits, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&ov_wait_ns, ov_now() - t, __ATOMIC_RELAXED);
+        static int nlog = -1;  // XCDE_OVERLAP_WHO=<n>: the first n waits - page, who, and the faulting code (RIP + stack words)
+        if (nlog < 0) nlog = getenv("XCDE_OVERLAP_WHO") ? atoi(getenv("XCDE_OVERLAP_WHO")) : 0;
+        if (nlog > 0 && ov_fault_uc) {
+            nlog--;
+            extern char __executable_start[];
+            const ucontext_t *uc = ov_fault_uc;
+            const uint64_t *sp = (const uint64_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+            fprintf(stderr, "[overlap-who] %s %s page %llx (%s frame set, gpu-%s) %.2f ms in, waited %.2f ms; base %p rip %llx stack",
+                    gettid() == ov_worker ? "worker" : "game", write ? "write" : "read", (unsigned long long)fa, o == c ? "current" : "previous",
+                    o->w[r] ? "written" : "read", (t - ov_t0) / 1e6, (ov_now() - t) / 1e6, (void *)__executable_start,
+                    (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
+            for (int i = 0; i < 24; i++) fprintf(stderr, " %llx", (unsigned long long)sp[i]);
+            fputc(10, stderr);
+        }
     }
     mprotect((void *)(uintptr_t)(fa & ~0xFFFull), 4096, PROT_READ | PROT_WRITE);
     return true;
@@ -326,7 +341,10 @@ void plat_ov_report(void) {
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
 #if defined(__x86_64__)
-    if (sig == SIGSEGV && ov_fault((uint64_t)(uintptr_t)si->si_addr, (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0)) return;  // [XCDE]
+    ov_fault_uc = uc;
+    bool ov_hit = sig == SIGSEGV && ov_fault((uint64_t)(uintptr_t)si->si_addr, (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0);  // [XCDE]
+    ov_fault_uc = NULL;
+    if (ov_hit) return;
 #endif
     static volatile int depth;
     if (sig == SIGABRT && depth++ > 0) { signal(SIGABRT, SIG_DFL); abort(); }  // (nested: just die)
