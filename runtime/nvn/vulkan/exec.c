@@ -7168,12 +7168,18 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 // [XCDE] perf: the game submits its whole frame as one or two command lists and waits for the previous frame's fence
 // about a frame later. One Vulkan submission per list meant the GPU started only once the render thread had recorded
 // all of it: frame time = recording + GPU time (8 + 12.8 ms in the heavy meadow view at 4K: 49 fps at 60). Now the
-// recorded work is submitted every XCDE_SUBMIT_DRAWS draws (default 400; 0 = off) so the GPU runs alongside the
+// recorded work is submitted every XCDE_SUBMIT_DRAWS draws (default 400, Linux 100; 0 = off) so the GPU runs alongside the
 // recording. (An occlusion count split across two submissions reports "visible": safe, as before T139.)
 // (split_since: declared with split_pending)
 static void split_submit(void) {
     static int every = -1;
+    // [XCDE] Linux: every 100 (Steam Deck: the GPU otherwise waits for most of the frame's recording; with the placed
+    // heap a submission costs ~0.1 ms. 100 vs 400 in the field: ~50 -> ~60 fps, the CPU then boosts to 3.1 GHz).
+#ifdef __linux__
+    if (every < 0) { const char *e = getenv("XCDE_SUBMIT_DRAWS"); every = e ? atoi(e) : 100; }
+#else
     if (every < 0) { const char *e = getenv("XCDE_SUBMIT_DRAWS"); every = e ? atoi(e) : 400; }
+#endif
     if (!every || ++split_since < (uint32_t)every) return;
     // at the next pass boundary (no extra pass break: each break stores and reloads every attachment); a run of
     // draws with no boundary for 4x as long is split right here as before
