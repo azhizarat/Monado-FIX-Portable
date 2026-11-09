@@ -541,8 +541,9 @@ void vc_flush(void);
 bool g_gpuprof_frame;
 static VkQueryPool gp_qp;
 static int gp_n;
-static char gp_label[512][112];
-static uint32_t gp_draws[512];
+#define GP_MAX 8192  // [XCDE] (was 512: XCDE_GPUPROF_DRAWS marks every draw)
+static char gp_label[GP_MAX][112];
+static uint32_t gp_draws[GP_MAX];
 // LARECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with LARECOMP_SYNC_SUBMIT=1 the
 // dump ends with the command list that faulted).
 static char dl_ring[64][128];
@@ -563,12 +564,12 @@ void vk_devlost_dump(void) {
     for (unsigned i = dl_n > 64 ? dl_n - 64 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 63]);
 }
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
-    if (!g_gpuprof_frame || gp_n >= 511) return;
+    if (!g_gpuprof_frame || gp_n >= GP_MAX - 1) return;
     if (!gp_qp) {
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 512};
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_MAX};
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &gp_qp) != VK_SUCCESS) { g_gpuprof_frame = false; return; }
     }
-    if (!gp_n) vkCmdResetQueryPool(cb, gp_qp, 0, 512);
+    if (!gp_n) vkCmdResetQueryPool(cb, gp_qp, 0, GP_MAX);
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_qp, (uint32_t)gp_n);
     va_list ap;
     va_start(ap, fmt);
@@ -581,7 +582,7 @@ void renderer_flush(void);
 void vk_gpuprof_report(void) {
     if (!gp_n) return;
     renderer_flush();
-    uint64_t t[512];
+    static uint64_t t[GP_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
@@ -5604,7 +5605,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // item cursor, widescreen backdrop detection) ran here on every draw; XCDE has none of them. The fragment
     // program hash is computed only for the debug switches that use it.
     static int fsh = -1;
-    if (fsh < 0) fsh = getenv("LARECOMP_SKIP_FSHASH") || getenv("LARECOMP_LOG_FSHASH") || getenv("XCDE_WATCH_FS") || ct_on() || amd_igpu_heavy_skip() || hunt_on() || getenv("XCDE_DUMP_FS_HASH") || getenv("XCDE_BLUE_FIX");
+    if (fsh < 0) fsh = getenv("LARECOMP_SKIP_FSHASH") || getenv("LARECOMP_LOG_FSHASH") || getenv("XCDE_WATCH_FS") || ct_on() || amd_igpu_heavy_skip() || hunt_on() || getenv("XCDE_DUMP_FS_HASH") || getenv("XCDE_BLUE_FIX") || getenv("XCDE_GPUPROF_DRAWS");
     if (fsh || g_settings.dof_off) {  // (depth of field: the F1 menu turns it off and on while playing)
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
@@ -5744,6 +5745,11 @@ static void draw_(CmdRec *r, bool indexed) {
     if (g_gpuprof_frame) {  // [XCDE] XCDE_GPUPROF_VS=<hex vs>[,...]: with LARECOMP_GPUPROF_AT, a timestamp before each draw of those programs
         static uint64_t pvs[8]; static int npvs = -1;
         if (npvs < 0) { npvs = 0; for (const char *p = getenv("XCDE_GPUPROF_VS"); p && *p && npvs < 8;) { pvs[npvs++] = strtoull(p, (char **)&p, 16); if (*p == ',') p++; else break; } }
+        // [XCDE] XCDE_GPUPROF_DRAWS=1: a timestamp before every draw, labelled with its fragment program hash
+        // (scripts/linux/gpuprof_sum.py adds them up per shader)
+        static int pdraws = -1;
+        if (pdraws < 0) pdraws = getenv("XCDE_GPUPROF_DRAWS") != NULL;
+        if (pdraws) gp_mark(cb, "  draw fs %016llx", (unsigned long long)g_cur_fs_hash);
         for (int i = 0; i < npvs; i++)
             if (st.program->stages[0].code_addr == pvs[i])
                 gp_mark(cb, "  draw vs %llx inst %llu count %llu", (unsigned long long)pvs[i], (unsigned long long)(indexed ? r->x[6] : r->x[4]),
