@@ -144,6 +144,10 @@ int main(int argc, char **argv) {
     kernel_init();
     dispatch_init();
 
+#ifdef XCDE_GFX
+    extern bool vk_heap_place(void);  // [XCDE] Linux: the guest heap in GPU memory before anything is in it (heap_placed.c)
+    vk_heap_place();
+#endif
     uint32_t stack_size = 0x100000;
     int prio = 44;
     FILE *f = fopen(npdm_path, "rb");

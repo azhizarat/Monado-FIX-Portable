@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "../../kernel.h"
 #include "shaders.h"
@@ -4301,7 +4302,43 @@ void vk_gmem_check(uint64_t frame) {
         (unsigned long long)pages, (unsigned long long)first);
 }
 
+// [XCDE] Linux: the heap was placed in GPU memory at boot (heap_placed.c): import that buffer object (all of HEAP_MAX,
+// so it never grows) instead of the host pointer.
+static bool gmem_import_placed(void) {
+    extern int vk_heap_fd(VkPhysicalDevice phys, uint32_t *type);
+    uint32_t type;
+    int fd = g_vk.heap_fd_import ? vk_heap_fd(g_vk.phys, &type) : -1;
+    if (fd < 0) return false;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = HEAP_MAX,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+    VkBuffer buf;
+    if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { close(fd); return false; }
+    VkMemoryRequirements rq;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &rq);
+    VkImportMemoryFdInfoKHR imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                   .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = fd};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = HEAP_MAX,
+                               .memoryTypeIndex = type};
+    VkDeviceMemory mem;
+    if (!(rq.memoryTypeBits & (1u << type)) || rq.size > HEAP_MAX || vkAllocateMemory(g_vk.dev, &ai, NULL, &mem) != VK_SUCCESS) {
+        close(fd);  // (a successful import owns the fd; a failed one does not)
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        LOG("[vk] placed guest heap: import failed, using the host-memory import\n");
+        return false;
+    }
+    if (vkBindBufferMemory(g_vk.dev, buf, mem, 0) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, buf, NULL); vkFreeMemory(g_vk.dev, mem, NULL); return false; }
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = HEAP_MAX;
+    LOG("[vk] guest heap shared with the GPU (placed, %llu MB): no host-memory import\n", (unsigned long long)(HEAP_MAX >> 20));
+    return true;
+}
+
 static bool gmem_import(uint64_t size) {
+    if (!gmem_buf && gmem_import_placed()) return true;
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
         (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryHostPointerPropertiesEXT");
     VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
