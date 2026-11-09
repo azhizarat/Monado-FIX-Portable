@@ -73,6 +73,8 @@ static _Atomic uint64_t stat_gpl_cached, stat_gpl_linked, stat_gpl_libs, stat_gp
 static uint32_t pipe_count(void);  // (stats line)
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
 static uint32_t prof_end_line[16384];  // passes ended, by the exec.c line that ended them (0: submit / present)
+static uint32_t prof_dirty_line[16384], rt_dirty_line;  // [XCDE] passes restarted by begin_pass, by the line that set rt_dirty
+#define RT_DIRTY() (st.rt_dirty = true, rt_dirty_line = __LINE__)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
 uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
@@ -1316,6 +1318,11 @@ const char *renderer_stats(void) {
             if (prof_end_line[l] > 20) { n = strlen(stats_text); snprintf(stats_text + n, sizeof stats_text - n, " %d:%u", l, prof_end_line[l]); }
         memset(prof_end_line, 0, sizeof prof_end_line);
         n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | restarts by:");
+        for (int l = 0; l < 16384; l++)
+            if (prof_dirty_line[l] > 20) { n = strlen(stats_text); snprintf(stats_text + n, sizeof stats_text - n, " %d:%u", l, prof_dirty_line[l]); }
+        memset(prof_dirty_line, 0, sizeof prof_dirty_line);
+        n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | views created %llu | counters gpu %llu | pace %s, %llu frames over", (unsigned long long)prof_views_created,
                  (unsigned long long)stat_counters_gpu, pace_slow ? "30" : "60", (unsigned long long)stat_pace_over);
         stat_counters_gpu = stat_pace_over = 0;
@@ -1736,6 +1743,7 @@ static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pass_seq_no++;
     bool was_in_pass = in_pass, untracked = pass_untracked;
+    if (prof && in_pass && rt_dirty_line < 16384) prof_dirty_line[rt_dirty_line]++;
     vk_end_pass();
     if (!was_in_pass) pass_untracked = untracked;  // (that call ended nothing: keep how the last pass ended)
     if (split_pending) {  // [XCDE] perf: the split submission goes here, where the game's pass ends anyway
@@ -4022,7 +4030,7 @@ static void alias_copy(CopyAlias *a, VkImageAspectFlags aspects, const char *why
     aspects &= d->aspect;
     if (!aspects) return;
     vk_end_pass();
-    st.rt_dirty = true;
+    RT_DIRTY();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     gp_mark(cb, "copy texture (deferred, %s%s) %ux%u", why, aspects == d->aspect ? "" : ", stencil only", a->dst->width, a->dst->height);
@@ -4058,7 +4066,7 @@ static void alias_before_write(NvnTexture *t, VkImageAspectFlags full, const cha
         CopyAlias *a = &aliases[rename];
         TexBackend *s = a->src->backend, *d = a->dst->backend;
         vk_end_pass();
-        st.rt_dirty = true;
+        RT_DIRTY();
         VkImage im = s->image; s->image = d->image; d->image = im;
         VmaAllocation m = s->mem; s->mem = d->mem; d->mem = m;
         vk_views_forget(s);
@@ -4198,7 +4206,7 @@ static void resolve_feedback(Prog *pr) {
             if (direct < 0) { const char *e = getenv("LARECOMP_FEEDBACK_DIRECT"); direct = !e || atoi(e) != 0; }
             if (direct && t != st.rt.depth) {
                 // [XCDE] the attachment is read in the draw that writes it: no colour compression (textures.c want_no_dcc)
-                if (t->backend && ((TexBackend *)t->backend)->nlean) { vk_end_pass(); st.rt_dirty = true; vk_tex_drop_dcc(t, vk_cmd()); }
+                if (t->backend && ((TexBackend *)t->backend)->nlean) { vk_end_pass(); RT_DIRTY(); vk_tex_drop_dcc(t, vk_cmd()); }
                 continue;
             }
             bool have = false;
@@ -4257,7 +4265,7 @@ static void resolve_feedback(Prog *pr) {
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
-            st.rt_dirty = true;
+            RT_DIRTY();
         }
 }
 
@@ -5380,8 +5388,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     }
     uint64_t seq=vk_pending_seq(), lid=(uint64_t)(uintptr_t)layout;
     XcdeDescriptorEntry *entry=&descriptor_cache[xcde_descriptor_slot(lid,keys,(unsigned)n)];
-    const char *override=getenv("XCDE_DESCRIPTOR_CACHE");
-    bool enabled=!override || atoi(override)!=0;
+    static int enabled = -1;  // (was a getenv per call: a scan of Steam's large environment per stage per draw)
+    if (enabled < 0) { const char *e = getenv("XCDE_DESCRIPTOR_CACHE"); enabled = !e || atoi(e) != 0; }
     if (enabled && xcde_descriptor_match(entry,seq,lid,keys,(unsigned)n)) {
         metric_desc_hits++; return (VkDescriptorSet)(uintptr_t)entry->handle;
     }
@@ -5873,7 +5881,7 @@ static void draw_(CmdRec *r, bool indexed) {
                     if (told < 4) { told++; LOG("[vk] SUATOM image: nvn fmt %#x %ux%u (stage %d)\n", t->format, t->width, t->height, s); }
                 }
                 if (!t || (t->backend && (((TexBackend *)t->backend)->has_storage || ((TexBackend *)t->backend)->storage_failed))) continue;
-                vk_end_pass(); st.rt_dirty = true;
+                vk_end_pass(); RT_DIRTY();
                 vk_tex_add_storage(t, vk_cmd());
             }
     }
@@ -5894,7 +5902,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (pr->fi->uses_gmem_store) wst |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     if (pr->gi && pr->gi->uses_gmem_store) wst |= VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT;
     if (wst) {
-        if (in_pass) st.rt_dirty = true;
+        if (in_pass) RT_DIRTY();
         pre_wr |= wst;  // (the barrier before it: earlier reads of guest memory first, T136)
     }
     static int simg_full = -1;  // XCDE_SIMG_FULL=1: storage images untracked (full barriers around their passes, as before)
@@ -5919,7 +5927,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (!b || b->w_epoch != pass_epoch) continue;
                 if (cont && is_attachment(t)) continue;
                 pass_hazard = true;
-                if (cont) st.rt_dirty = true;  // (restart the pass behind a full barrier)
+                if (cont) RT_DIRTY();  // (restart the pass behind a full barrier)
             }
         }
     }
@@ -5932,7 +5940,7 @@ static void draw_(CmdRec *r, bool indexed) {
         static uint64_t last_pass_seq;
         if (in_pass && tmp_enabled() && pass_dbg_rt && pass_dbg_rt->presented && tmp_scene_frame == renderer_present_count() &&
             !tmp_hud_started() && pass_draws >= 1 && last_pass_seq == pass_seq_no)
-            st.rt_dirty = true;
+            RT_DIRTY();
         if (last_pass_seq != pass_seq_no || st.rt_dirty || !in_pass) pass_draws = 0;
         begin_pass();
         last_pass_seq = pass_seq_no;
@@ -6520,7 +6528,7 @@ static void draw_(CmdRec *r, bool indexed) {
             split = getenv("XCDE_SPLIT_DRAWS") ? atoi(getenv("XCDE_SPLIT_DRAWS")) : -1;
             if (getenv("XCDE_SPLIT_DRAWS_TO")) split_to = atoi(getenv("XCDE_SPLIT_DRAWS_TO"));
         }
-        if (split >= 0 && debug_pass_no >= split && debug_pass_no <= split_to) { vk_end_pass(); st.rt_dirty = true; }
+        if (split >= 0 && debug_pass_no >= split && debug_pass_no <= split_to) { vk_end_pass(); RT_DIRTY(); }
     }
     stat_draws++, g_draws_total++;
     cum_draws++;
@@ -6529,12 +6537,12 @@ static void draw_(CmdRec *r, bool indexed) {
     // no ordering inside a render pass. Without it the depth prepass drew grass from a half-written vertex buffer, the
     // G-buffer grass then failed its EQUAL depth test: black grass. The next draw starts a new pass behind a full barrier.
     if (pr->vi->uses_gmem_store || pr->fi->uses_gmem_store || (pr->gi && pr->gi->uses_gmem_store)) {
-        vk_end_pass(); st.rt_dirty = true; pass_untracked = !(mem_track_mode() & 1);
+        vk_end_pass(); RT_DIRTY(); pass_untracked = !(mem_track_mode() & 1);
         if (nwant) { if (pr->vi->uses_gmem_store) xsh_stored(0); if (pr->fi->uses_gmem_store) xsh_stored(1); }  // (T197)
     }
     if (xfb_bytes || pr->vi->uses_gmem_store || pr->fi->uses_gmem_store || (pr->gi && pr->gi->uses_gmem_store)) atomic_store(&host_read_pending, true);
     gmem_stage_finish(xfb_bytes || pr->vi->uses_gmem_store || pr->fi->uses_gmem_store || (pr->gi && pr->gi->uses_gmem_store));
-    if (xfb_bytes) { vk_end_pass(); st.rt_dirty = true; xsh_written(st.xfb_buf[0].addr, st.xfb_buf[0].size, xfb_at, xfb_bytes); }  // [XCDE] T175
+    if (xfb_bytes) { vk_end_pass(); RT_DIRTY(); xsh_written(st.xfb_buf[0].addr, st.xfb_buf[0].size, xfb_at, xfb_bytes); }  // [XCDE] T175
     if (g_debug_frame && getenv("XCDE_DUMP_VB")) {  // [XCDE] debugging: what each stream holds when the GPU has run this draw
         char code[32]; snprintf(code, sizeof code, "%llx", (unsigned long long)st.program->stages[0].code_addr);
         if (strstr(getenv("XCDE_DUMP_VB"), code)) {
@@ -6552,7 +6560,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 LOG(" s%d %llx+%llu=%08x", s, (unsigned long long)dbg_vb_addr[s], (unsigned long long)n, (unsigned)(h ^ (h >> 32)));
             }
             LOG("\n");
-            st.rt_dirty = true;
+            RT_DIRTY();
         }
     }
     if (dump_fs_want() && dump_fs_want() == g_cur_fs_hash) {  // [FIX-TEX] the first bytes of every vertex stream of the first draws with that fragment shader
@@ -6597,7 +6605,7 @@ static void draw_(CmdRec *r, bool indexed) {
         LOG("[xfb-data] %llx +%llu hash %016llx :", (unsigned long long)at, (unsigned long long)bytes, (unsigned long long)h);
         for (int i = 0; i < 24 && (uint64_t)i < bytes; i++) LOG(" %02x", m[i]);
         LOG("\n");
-        st.rt_dirty = true;
+        RT_DIRTY();
     }
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
@@ -7502,7 +7510,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.has_dview = rt->has_dview;
             static int always = -1;
             if (always < 0) always = getenv("LARECOMP_VK_PASS_RESTART") != NULL;
-            if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true, g_pipe_state_gen++;  // [XCDE] (key memo: on a change)
+            if (always || memcmp(&prev, &st.rt, sizeof prev)) RT_DIRTY(), g_pipe_state_gen++;  // [XCDE] (key memo: on a change)
             break;
         }
         case CMD_SET_VIEWPORTS:
@@ -7574,7 +7582,7 @@ static void exec_list(uint64_t handle, int depth) {
             // overlapped on the GPU: exploded hair and cloth, run-to-run differences (T124). The next draw starts a
             // new pass, which begins with a full barrier. (bits 0: the list-start marker of BeginRecording)
             if (g_debug_frame) LOG("[barrier] (pass %d) bits %#x in_pass %d\n", debug_pass_no, (unsigned)r->x[0], (int)in_pass);
-            if ((uint32_t)r->x[0] && in_pass) { vk_end_pass(); st.rt_dirty = true; pass_untracked = !(mem_track_mode() & 2); }  // (T162: tracked)
+            if ((uint32_t)r->x[0] && in_pass) { vk_end_pass(); RT_DIRTY(); pass_untracked = !(mem_track_mode() & 2); }  // (T162: tracked)
             break;
         case CMD_CLEAR_COLOR: {
             snap_reason = "clear-color"; snapshots_invalidate(NULL);
@@ -7611,7 +7619,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.ncolor = 1;
             st.rt.color[0] = t;
             if (ct->has_view) { st.rt.cview[0] = ct->view; st.rt.has_cview[0] = 1; }
-            st.rt_dirty = true;
+            RT_DIRTY();
             const int32_t *rg = ct->region;
             if (rg[3] > 0 && rg[4] > 0) { st.scissor[0][0] = rg[0]; st.scissor[0][1] = rg[1]; st.scissor[0][2] = rg[3]; st.scissor[0][3] = rg[4]; }
             else { st.scissor[0][0] = st.scissor[0][1] = 0; st.scissor[0][2] = st.scissor[0][3] = 16384; }
@@ -7619,7 +7627,7 @@ static void exec_list(uint64_t handle, int depth) {
             vk_end_pass();
             st.rt = saved;
             memcpy(st.scissor[0], sc, sizeof sc);
-            st.rt_dirty = true;
+            RT_DIRTY();
             break;
         }
         case CMD_CLEAR_DEPTH_STENCIL:
