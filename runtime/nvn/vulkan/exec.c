@@ -2042,6 +2042,7 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 }
 
 static uint64_t hmix(uint64_t h, const void *p, size_t n);
+static uint64_t fs_code_hash(uint64_t fs);
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("LARECOMP_SAVE_MSL")) return;
     mkdir("build/glsl", 0755);
@@ -2161,7 +2162,8 @@ static void translate_program(void *arg) {
         // of the same program) to build/glsl/<hash>_fs.glsl / _vs.glsl. The hash is the one the [hunt] log lines / skip_fs.txt show.
         const char *dh = getenv("XCDE_DUMP_FS_HASH");
         if (dh && *dh && p->code[1]) {
-            uint64_t want = strtoull(dh, NULL, 16), got = hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200);
+            uint64_t got = fs_code_hash(p->code[1]), want = 0;  // [XCDE] a comma-separated list of hashes
+            for (const char *q = dh; *q && !want;) { uint64_t w = strtoull(q, (char **)&q, 16); if (w == got) want = w; while (*q == ',') q++; if (!w) break; }
             if (want && got == want) {
                 mkdir("build/glsl", 0755);
                 const char *srcs[2] = {p->fi->msl, p->vi->msl}, *suf[2] = {"fs", "vs"};
