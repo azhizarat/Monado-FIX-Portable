@@ -465,6 +465,16 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
 void vk_external_state_changed(void) { ss_forget(); dyn_defaults(vk_cmd()); }
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
+// [XCDE] perf: a slot's query pools are reset from the CPU when the host-reset feature is there. vk_cmd runs after
+// sub() waited for the slot's previous submission and its results were read, so nothing uses the queries. On RADV a
+// command-buffer reset is a fill shader plus a cache flush - 14 times a frame for the 4096-query occlusion pool alone.
+// XCDE_HOST_QUERY_RESET=0: reset in the command buffer, as before.
+static void reset_query_pool(VkCommandBuffer cb, VkQueryPool pool, uint32_t n) {
+    static int host = -1;
+    if (host < 0) { const char *e = getenv("XCDE_HOST_QUERY_RESET"); host = g_vk.host_query_reset && !(e && atoi(e) == 0); }
+    if (host) vkResetQueryPool(g_vk.dev, pool, 0, n);
+    else vkCmdResetQueryPool(cb, pool, 0, n);
+}
 VkCommandBuffer vk_cmd(void) {
     Sub *s = sub();
     if (!s->main_begun) {
@@ -485,7 +495,7 @@ VkCommandBuffer vk_cmd(void) {
             q->n = 0;  // (resolved when the slot was freed: sub())
             q->seq = s->seq;
             pthread_mutex_unlock(&cq_lock);
-            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
+            if (q->pool) reset_query_pool(s->main, q->pool, CQ_MAX);
         }
         if (oq_enabled()) {  // [XCDE] T139: this slot's occlusion queries
             OccQ *q = &oq[cur_sub];
@@ -498,7 +508,7 @@ VkCommandBuffer vk_cmd(void) {
             q->n = q->nrep = 0;  // (resolved when the slot was freed: sub())
             q->seq = s->seq;
             pthread_mutex_unlock(&cq_lock);
-            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, OQ_MAX);
+            if (q->pool) reset_query_pool(s->main, q->pool, OQ_MAX);
         }
         if (ck_on()) {  // [XCDE] T143: this slot's EQUAL-draw checks
             CheckQ *q = &ckq[cur_sub];
@@ -511,7 +521,7 @@ VkCommandBuffer vk_cmd(void) {
             q->n = 0;
             q->seq = s->seq;
             pthread_mutex_unlock(&cq_lock);
-            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CK_MAX);
+            if (q->pool) reset_query_pool(s->main, q->pool, CK_MAX);
         }
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
         if (prof_qp && (prof || g_settings.res_mode==RES_DYNAMIC)) {
@@ -610,13 +620,76 @@ void vk_gpuprof_report(void) {
     gp_n = 0;
 }
 
+// ---- [XCDE] perf: submission thread. vkQueueSubmit2 cost the render worker ~67 us each (14 a frame on the Deck: the
+// kernel's buffer-list validation), ~5 % of its time. The worker now ends its command buffers and queues them here, in
+// order, with their timeline value already assigned (waiting for a timeline value whose submission is still queued is
+// legal: it just waits longer). Everything else that uses the queue - present (binary semaphores need their signal
+// submitted first), vkDeviceWaitIdle - calls vk_submit_drain first. XCDE_SUBMIT_THREAD=0: submit inline, as before
+// (default off outside Linux for now).
+typedef struct { VkCommandBufferSubmitInfo cbs[2]; int n; VkSemaphore wait, signal; uint64_t value; } SubJob;
+#define SQ_N 32
+static SubJob sq[SQ_N];
+static uint64_t sq_head, sq_tail;  // (sq_lock) queued / submitted
+static pthread_mutex_t sq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sq_more = PTHREAD_COND_INITIALIZER, sq_done = PTHREAD_COND_INITIALIZER;
+static void sq_submit(const SubJob *j) {
+    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
+                                     .value = j->value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
+                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = j->signal,
+                                     .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = j->wait,
+                                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)j->n, .pCommandBufferInfos = j->cbs,
+                        .signalSemaphoreInfoCount = j->signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
+                        .waitSemaphoreInfoCount = j->wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
+    VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+    if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
+    VK_CHECK(sr);
+}
+static void *sq_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&sq_lock);
+    for (;;) {
+        while (sq_tail == sq_head) pthread_cond_wait(&sq_more, &sq_lock);
+        SubJob j = sq[sq_tail % SQ_N];
+        pthread_mutex_unlock(&sq_lock);
+        sq_submit(&j);
+        pthread_mutex_lock(&sq_lock);
+        sq_tail++;
+        pthread_cond_broadcast(&sq_done);
+    }
+    return NULL;
+}
+static bool sq_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XCDE_SUBMIT_THREAD");
+#ifdef __linux__
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+        pthread_t t;
+        if (on && pthread_create(&t, NULL, sq_thread, NULL) != 0) on = 0;
+        if (on) { pthread_detach(t); LOG("[vk] submission thread on\n"); }
+    }
+    return on;
+}
+// every queued submission handed to the driver (before any other use of the queue)
+void vk_submit_drain(void) {
+    if (!sq_on()) return;
+    pthread_mutex_lock(&sq_lock);
+    while (sq_tail != sq_head) pthread_cond_wait(&sq_done, &sq_lock);
+    pthread_mutex_unlock(&sq_lock);
+}
+
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
     vk_end_pass();
     Sub *s = sub();
     if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
-    VkCommandBufferSubmitInfo cbs[2];
+    VkCommandBufferSubmitInfo cbs[2] = {0};
     int n = 0;
     vc_flush();
     ring_flush(submit_seq + 1);
@@ -639,21 +712,20 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
-    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
-                                     .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
-                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
-                                     .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
-    VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
-                                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
-                        .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
-                        .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     {
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
-        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
-        if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
-        VK_CHECK(sr);
+        SubJob j = {.cbs = {cbs[0], cbs[1]}, .n = n, .wait = wait, .signal = signal, .value = submit_seq + 1};
+        if (sq_on()) {
+            pthread_mutex_lock(&sq_lock);
+            while (sq_head - sq_tail == SQ_N) pthread_cond_wait(&sq_done, &sq_lock);
+            sq[sq_head % SQ_N] = j;
+            sq_head++;
+            pthread_cond_signal(&sq_more);
+            pthread_mutex_unlock(&sq_lock);
+        } else {
+            sq_submit(&j);
+        }
         PROF_ADD(prof_submit);
     }
     pthread_mutex_lock(&seq_lock);  // (sequence and ring slot published together: renderer_fence_seq reads both)
@@ -1859,7 +1931,17 @@ static void begin_pass(void) {
     for (uint32_t i = 0; i < pass_ncolor; i++) if (g_watch_img && st.rt.color[i] && st.rt.color[i]->backend && ((TexBackend *)st.rt.color[i]->backend)->image == g_watch_img) vk_watch(g_watch_img, "begin_pass (COLOR attachment)");
     pass_mark_attachments();  // [XCDE] T162
     vkCmdBeginRendering(cb, &ri);
-    ss_forget();  // (whatever ran between the passes may have set its own state)
+    {   // [XCDE] perf: the cached state survives a pass change - Vulkan keeps the bound pipeline, dynamic state, vertex
+        // buffers and sets across render passes of a command buffer. Forgetting it at every pass (~400 a frame) made the
+        // next draw rebind all of it. It is forgotten when something else began a pass of its own since our last one
+        // (post / present / save / temporal / window passes set their own pipeline and state; the clear pipeline, DLSS
+        // and a new command buffer forget it themselves). XCDE_PASS_SS_FORGET=1: forget at every pass, as before.
+        static uint32_t ours;
+        static int every = -1;
+        if (every < 0) every = getenv("XCDE_PASS_SS_FORGET") && atoi(getenv("XCDE_PASS_SS_FORGET")) != 0;
+        if (every || g_vk_begin_count != ours + 1) ss_forget();
+        ours = g_vk_begin_count;
+    }
     in_pass = true;
     if (oq_counting) oq_begin(cb);  // [XCDE] T139: this pass's samples count toward the open counter
     pass_dbg_rt = st.rt.ncolor && st.rt.color[0] ? (TexBackend *)st.rt.color[0]->backend : NULL;

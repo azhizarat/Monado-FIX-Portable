@@ -396,7 +396,7 @@ static PFN_vkVoidFunction VKAPI_PTR ffx_proc(VkDevice d, const char *name) {
 }
 static bool fsr_context(uint32_t ow, uint32_t oh) {
     if (fsr_ctx && fsr_w == ow && fsr_h == oh) return true;
-    if (fsr_ctx) { vkDeviceWaitIdle(g_vk.dev); ffx_destroy(&fsr_ctx, NULL); fsr_ctx = NULL; }
+    if (fsr_ctx) { vk_submit_drain(); vkDeviceWaitIdle(g_vk.dev); ffx_destroy(&fsr_ctx, NULL); fsr_ctx = NULL; }
     struct ffxCreateBackendVKDesc be = {.header = {.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK},
                                         .vkDevice = g_vk.dev, .vkPhysicalDevice = g_vk.phys, .vkDeviceProcAddr = ffx_proc};
     struct ffxCreateContextDescUpscale cd = {.header = {.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, .pNext = &be.header},

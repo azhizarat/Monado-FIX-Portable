@@ -42,7 +42,7 @@ typedef struct {
     VkPipelineCache pcache;
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
-    bool custom_border, divisor, host_import, robust2, logic_op, minmax;
+    bool custom_border, divisor, host_import, robust2, logic_op, minmax, host_query_reset;  // (host_query_reset: vkResetQueryPool from the CPU)
     bool heap_fd_import;  // [XCDE] VK_KHR_external_memory_fd: the placed guest heap (heap_placed.c)
     bool gpl;  // [XCDE] T188: VK_EXT_graphics_pipeline_library with fast linking (exec.c build_pipeline)
     // [XCDE] FSR 3 frame generation's queues (device.c create_device): present, image acquire, async compute; fam UINT32_MAX: none
@@ -62,7 +62,9 @@ extern XcdeGpu *g_vk_adapters;
 extern uint32_t g_vk_adapter_count;
 
 // [XCDE] T250: do not call core 1.3 loader stubs on 1.2 extension devices.
-#define vkCmdBeginRendering g_vk.dispatch.begin_rendering
+void vk_submit_drain(void);  // [XCDE] queued submissions handed to the driver (exec.c): before any other use of the queue
+extern uint32_t g_vk_begin_count;  // [XCDE] render passes begun by anyone (exec.c begin_pass: did anything else draw since)
+#define vkCmdBeginRendering(cb, ri) (g_vk_begin_count++, g_vk.dispatch.begin_rendering((cb), (ri)))
 #define vkCmdEndRendering g_vk.dispatch.end_rendering
 #define vkCmdPipelineBarrier2 g_vk.dispatch.barrier2
 #define vkQueueSubmit2 g_vk.dispatch.submit2

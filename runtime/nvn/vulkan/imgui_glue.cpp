@@ -34,6 +34,7 @@ extern "C" bool vk_imgui_backend_init(void) {
 
 extern "C" void vk_imgui_backend_shutdown(void) {
     if (!ImGui::GetIO().BackendRendererUserData) return;
+    vk_submit_drain();
     vkDeviceWaitIdle(g_vk.dev);
     ImGui_ImplVulkan_Shutdown();
 }

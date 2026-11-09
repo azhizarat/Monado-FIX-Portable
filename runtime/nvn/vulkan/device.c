@@ -25,6 +25,7 @@
 #include "../../env_cache.h"  // (last: cached getenv)
 
 VkG g_vk;
+uint32_t g_vk_begin_count;  // [XCDE] (vk.h vkCmdBeginRendering)
 XcdeGpu *g_vk_adapters;
 uint32_t g_vk_adapter_count;
 static SDL_Window *window;
@@ -366,8 +367,10 @@ static void create_device(void) {
                                             .uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess,
                                             .storageBuffer8BitAccess = h12.storageBuffer8BitAccess,
                                             .scalarBlockLayout = h12.scalarBlockLayout, .shaderFloat16 = h12.shaderFloat16, .pNext = legacy ? (void *)&render_enable : (void *)&f13,
-                                            .samplerFilterMinmax = h12.samplerFilterMinmax};  // [XCDE] NVN reduction filters
+                                            .samplerFilterMinmax = h12.samplerFilterMinmax,  // [XCDE] NVN reduction filters
+                                            .hostQueryReset = h12.hostQueryReset};  // [XCDE] perf: query pools reset from the CPU (exec.c vk_cmd)
     g_vk.minmax = h12.samplerFilterMinmax;
+    g_vk.host_query_reset = h12.hostQueryReset;
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
                                                                .graphicsPipelineLibrary = VK_TRUE, .pNext = &f12};
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -704,7 +707,7 @@ static void create_swapchain(void) {
 }
 
 static void recreate_swapchain(void) {
-    sc_wait_idle(g_vk.dev);
+    vk_submit_drain(), sc_wait_idle(g_vk.dev);
     create_swapchain();
 }
 
@@ -842,6 +845,7 @@ void vk_frame_end(const char *shot_path) {
     extern const char *volatile g_rq_where;
     const char *was_pr = g_rq_where;
     vk_rq_at("vkQueuePresentKHR");
+    vk_submit_drain();  // (the present waits on a binary semaphore: its signal must be submitted first)
     VkResult r = sc_present(g_vk.queue, &pi);
     vk_rq_at(was_pr);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
@@ -1500,7 +1504,7 @@ static void quick_exit_handler(void) {
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
-        sc_wait_idle(g_vk.dev);
+        vk_submit_drain(), sc_wait_idle(g_vk.dev);
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         for (int i = 0; i < 500 && atomic_load(&pc_saving); i++) SDL_Delay(10);  // (a periodic save still writing)
         vk_pipeline_cache_save();
@@ -1573,7 +1577,7 @@ void backend_init(void) {
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
     if (!g_vk.dev) return;
-    sc_wait_idle(g_vk.dev);
+    vk_submit_drain(), sc_wait_idle(g_vk.dev);
     extern void vk_textures_reset(void);
     extern void vk_exec_reset(void);
     vk_textures_reset();

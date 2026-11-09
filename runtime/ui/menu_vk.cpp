@@ -358,6 +358,7 @@ static void ui(void) {
 }
 
 extern "C" void menu_render(void *cmd, uint32_t w, uint32_t h) {
+    vk_submit_drain();  // [XCDE] the backend may submit on the queue itself (texture uploads): the submission thread idles first
     static ImGuiContext *ctx;
     static float font_h;
     static uint64_t t_last;
