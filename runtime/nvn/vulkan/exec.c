@@ -63,6 +63,10 @@ static uint64_t metric_desc_hits, metric_desc_updates, metric_gmem_upload, metri
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
+// [XCDE] (LARECOMP_VK_PROF) "pre" in parts: 0 prewarm + shader key + program, 1 fs hash / skips / debug, 2 T192 + feedback +
+// snapshot invalidation, 3 barriers / epochs, 4 command buffer (begin_pass) + topology
+static uint64_t prof_pre_part[5], prof_pp_, stat_pipekey_memo;  // (+ draws that reused the previous pipeline)
+#define PRE_MARK(i) do { if (prof) { uint64_t n_ = SDL_GetTicksNS(); prof_pre_part[i] += n_ - prof_pp_; prof_pp_ = n_; } } while (0)
 static VkQueryPool prof_qp;
 static uint64_t prof_same_pipe, prof_same_prog;  // (profiler: draws repeating the previous draw's program / pipeline)
 static _Atomic uint64_t stat_gpl_cached, stat_gpl_linked, stat_gpl_libs, stat_gpl_opt;  // [XCDE] T188 (stats line)
@@ -1296,6 +1300,11 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, " | gpu %.0f cpu exec %.0f draw %.0f (pre %.0f key %.0f dyn %.0f sets %.0f tex %.0f (upload %.0f) vtx %.0f) submit %.0f ms",
                  prof_gpu / 1e6, prof_exec / 1e6, prof_draw / 1e6, prof_pre / 1e6, prof_key / 1e6, prof_dyn / 1e6, prof_sets / 1e6,
                  prof_tex / 1e6, prof_up / 1e6, prof_vtx / 1e6, prof_submit / 1e6);
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | pre: prog %.0f fs %.0f fb %.0f barrier %.0f pass %.0f | pipeline key memo %llu",
+                 prof_pre_part[0] / 1e6, prof_pre_part[1] / 1e6, prof_pre_part[2] / 1e6, prof_pre_part[3] / 1e6, prof_pre_part[4] / 1e6,
+                 (unsigned long long)stat_pipekey_memo);
+        stat_pipekey_memo = 0;
         extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | tex checks %llu samples %llu full %llu (%.1f MB, dynamic %llu)",
@@ -1339,12 +1348,38 @@ const char *renderer_stats(void) {
         prof_views_created = 0;
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
+        memset(prof_pre_part, 0, sizeof prof_pre_part);
     }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     return stats_text;
 }
 
+// [XCDE] perf: generation of the NVN state the pipeline key reads (bumped by every command except the few known not
+// to touch it, by st_defaults and by vk_exec_reset) and of the render pass (begin_pass): a draw with the same program,
+// topology class and both generations as the previous one reuses its pipeline without building and hashing the key.
+static uint32_t g_pipe_state_gen, g_pass_gen, g_pipe_bump_op;  // (g_pipe_bump_op: the command that last bumped it, XCDE_MEMO_WHY)
+static uint32_t g_tex_bind_gen[6], g_sbuf_bind_gen[6];  // ([XCDE] g_sbuf_bind_gen: CMD_BIND_STORAGE_BUFFERS, cbuf_info memo)  // [XCDE] per stage: bumped by CMD_BIND_TEXTURES (and st_defaults / vk_exec_reset)
+static bool cmd_keeps_pipe_key(uint32_t op) {
+    switch (op) {
+    case CMD_END: case CMD_JUMP: case CMD_CALL: case CMD_BIND_DEPTH_STENCIL: case CMD_BIND_VERTEX_BUFFERS:
+    case CMD_BIND_PROGRAM: case CMD_BIND_BLEND: case CMD_BIND_CHANNEL_MASK: case CMD_BIND_COLOR: case CMD_BIND_MULTISAMPLE:
+    case CMD_BIND_POLYGON: case CMD_BIND_VERTEX_ATTRIB: case CMD_BIND_VERTEX_STREAM: case CMD_SET_RENDER_TARGETS:
+    case CMD_CLEAR_COLOR: case CMD_CLEAR_DEPTH_STENCIL:  // (clears read the targets, change nothing the key reads)
+        // (these bump it themselves, on a change)
+    case CMD_BIND_UNIFORM_BUFFERS: case CMD_BIND_STORAGE_BUFFERS: case CMD_BIND_TEXTURES: case CMD_BIND_IMAGES:
+    case CMD_SET_TEXTURE_POOL: case CMD_SET_SAMPLER_POOL: case CMD_SET_VIEWPORTS: case CMD_SET_SCISSORS:
+    case CMD_SET_DEPTH_RANGES: case CMD_SET_BLEND_COLOR: case CMD_SET_STENCIL: case CMD_SET_PRIMITIVE_RESTART:
+    case CMD_SET_ALPHA_REF: case CMD_SET_DEPTH_BOUNDS: case CMD_SET_POLYGON_OFFSET: case CMD_SET_LINE_WIDTH:
+    case CMD_SET_POINT_SIZE: case CMD_DRAW_ARRAYS: case CMD_DRAW_ELEMENTS: case CMD_UPDATE_UNIFORM_BUFFER:
+    case CMD_FENCE_SYNC: case CMD_WAIT_SYNC: case CMD_REPORT_COUNTER: case CMD_SET_COPY_STRIDES: case CMD_BARRIER:
+        return true;
+    default:
+        return false;
+    }
+}
 static void st_defaults(void) {
+    g_pipe_state_gen++;
+    for (int i = 0; i < 6; i++) g_tex_bind_gen[i]++, g_sbuf_bind_gen[i]++;
     memset(&st, 0, sizeof st);
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
@@ -2215,12 +2250,12 @@ static _Atomic uint32_t g_tex_desc_gen;
 void vk_tex_desc_changed(void) { atomic_fetch_add_explicit(&g_tex_desc_gen, 1, memory_order_relaxed); }
 static uint32_t stencil_unit_mask_(int stage);
 static uint32_t stencil_unit_mask(int stage) {
-    static struct { uint32_t gen, mask; const void *tpool; uint64_t tex[32]; bool valid; } memo[6];
+    static struct { uint32_t gen, bind_gen, mask; const void *tpool; bool valid; } memo[6];
     uint32_t g = atomic_load_explicit(&g_tex_desc_gen, memory_order_relaxed);
     typeof(memo[0]) *m = &memo[stage];
-    if (m->valid && m->gen == g && m->tpool == st.tpool && !memcmp(m->tex, st.tex[stage], sizeof m->tex)) return m->mask;
+    if (m->valid && m->gen == g && m->bind_gen == g_tex_bind_gen[stage] && m->tpool == st.tpool) return m->mask;
     m->mask = stencil_unit_mask_(stage);
-    m->gen = g; m->tpool = st.tpool; memcpy(m->tex, st.tex[stage], sizeof m->tex); m->valid = true;
+    m->gen = g; m->bind_gen = g_tex_bind_gen[stage]; m->tpool = st.tpool; m->valid = true;
     return m->mask;
 }
 static uint32_t stencil_unit_mask_(int stage) {
@@ -3071,7 +3106,9 @@ static void lib_evict(uint64_t now, uint64_t min_age) {
 }
 
 static void pipe_evict(void) {  // (render thread)
-    if (pe_ndead) {
+    static uint64_t reaped_at;  // [XCDE] perf: the dead list once per submission, not every draw (a timeline query each)
+    if (pe_ndead && vk_pending_seq() != reaped_at) {
+        reaped_at = vk_pending_seq();
         uint64_t done = vk_completed_seq();
         size_t k = 0;
         for (size_t i = 0; i < pe_ndead; i++)
@@ -3148,6 +3185,9 @@ static void pipe_evict(void) {  // (render thread)
 
 static void gpl_reap(void) {  // (render thread)
     if (!__atomic_load_n(&gpl_ndead, __ATOMIC_RELAXED)) return;
+    static uint64_t reaped_at;  // [XCDE] perf: once per submission, not every draw (a timeline query and a lock each)
+    if (vk_pending_seq() == reaped_at) return;
+    reaped_at = vk_pending_seq();
     uint64_t done = vk_completed_seq(), pend = vk_pending_seq();
     pthread_mutex_lock(&gpl_lock);
     int k = 0;
@@ -4230,6 +4270,16 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
+    // [XCDE] perf: a graphics stage's driver constant buffer is built from its bound storage buffers only: the same
+    // submission, size and storage bindings give the same span (was a 2 KB clear + fill + compare per stage per draw).
+    static struct { uint64_t seq, size; uint32_t gen; VkDescriptorBufferInfo bi; bool valid; } drv_memo[3];
+    static int drv_memo_on = -1;
+    if (drv_memo_on < 0) { const char *e = getenv("XCDE_CBUF_MEMO"); drv_memo_on = !e || atoi(e) != 0; }
+    if (k == 0 && stage < 3 && drv_memo_on && !g_debug_frame) {
+        uint64_t size = si->cbuf_size[0] > 0x800 ? 0x800 : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        typeof(drv_memo[0]) *m = &drv_memo[stage];
+        if (m->valid && m->seq == vk_pending_seq() && m->size == size && m->gen == g_sbuf_bind_gen[stage]) return m->bi;
+    }
     if (k == 0) {
         uint32_t drv[0x800 / 4] = {0};
         if (stage == 5) {
@@ -4260,7 +4310,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         }
         uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
         if (size < 0x500 && stage == 5) size = 0x500;
-        return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        VkDescriptorBufferInfo bi = ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        if (stage < 3) {
+            drv_memo[stage].seq = vk_pending_seq(); drv_memo[stage].size = size; drv_memo[stage].gen = g_sbuf_bind_gen[stage];
+            drv_memo[stage].bi = bi; drv_memo[stage].valid = true;
+        }
+        return bi;
     }
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
@@ -5073,6 +5128,8 @@ static int g_cs_n;  // (compute program table below)
 // address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
 // programs, shared copies - and the heap import: its pages are replaced (re-imported on first use).
 void vk_exec_reset(void) {
+    g_pipe_state_gen++; g_pass_gen++;
+    for (int i = 0; i < 6; i++) g_tex_bind_gen[i]++, g_sbuf_bind_gen[i]++;
     memset(descriptor_cache,0,sizeof descriptor_cache);
     memset(gpu_frames,0,sizeof gpu_frames); gpu_last_tag=0; gpu_last_ms=-1;
     for (int i=0;i<SUBS;i++) subs[i].ts=subs[i].upload_ts=false;
@@ -5703,7 +5760,7 @@ static void draw(CmdRec *r, bool indexed) {
 }
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
-    if (prof) prof_tp_ = SDL_GetTicksNS();
+    if (prof) prof_tp_ = prof_pp_ = SDL_GetTicksNS();
     prewarm_drain();  // [XCDE] T163
     if (!st.program) { SKIPPED(); return; }
     {   // [XCDE] debugging: XCDE_SKIP_PROG=<fragment code addr hex>: drop the draws of that program
@@ -5752,6 +5809,7 @@ static void draw_(CmdRec *r, bool indexed) {
     { uint32_t m = (uint32_t)r->x[0]; g_draw_gs_in = m == 0 ? 1 : (m <= 3 || m == 0xa || m == 0xb) ? 2 : 3; }  // [XCDE] NVN draw mode -> GS input
     Prog *pr = get_program(st.program, &vkey, &fkey);
     bool pr_ok = pr && wait_ready(&pr->state, pr);
+    PRE_MARK(0);
     if (pr && g_last_wait_ns > build_wait_min()) build_wait_log(pr, NULL, g_last_wait_ns);
     if (!pr_ok) {
         static int nlog_;
@@ -5801,6 +5859,7 @@ static void draw_(CmdRec *r, bool indexed) {
         g_watch_img = ((TexBackend *)st.rt.depth->backend)->image;
     if (g_debug_frame) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
+    PRE_MARK(1);
     alias_draw_check();
     {   // [XCDE] T192: a texture used through SULD / SUST without storage usage yet gets it (re-created, contents copied)
         ShaderInfo *sis[3] = {pr->vi, pr->fi, pr->gi};
@@ -5829,6 +5888,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // 0 per batch, right after the previous batch's draws read it as instance data: Maxwell runs draws in order, Vulkan
     // overlaps them inside a pass, so the new capture overwrote data still being read - a grass tuft drawn with another
     // batch's positions missed its depth prepass and showed black for a frame (user report; timing dependent).
+    PRE_MARK(2);
     VkPipelineStageFlags2 wst = 0;  // [XCDE] T162 part 2: the stages of this draw that write guest memory
     if (xfb || pr->vi->uses_gmem_store) wst |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
     if (pr->fi->uses_gmem_store) wst |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -5899,6 +5959,7 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
     }
+    PRE_MARK(3);
     VkCommandBuffer cb = vk_cmd();
     if (g_gpuprof_frame) {  // [XCDE] XCDE_GPUPROF_VS=<hex vs>[,...]: with LARECOMP_GPUPROF_AT, a timestamp before each draw of those programs
         static uint64_t pvs[8]; static int npvs = -1;
@@ -5920,10 +5981,26 @@ static void draw_(CmdRec *r, bool indexed) {
     bool native = topology(mode, &topo, &cls);
     if (!native && mode != 6 && mode != 7 && mode != 9) { SKIPPED(); return; }
 
+    PRE_MARK(4);
     uint64_t prof_tk_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_pre += prof_tk_ - prof_tp_;
     // ---- pipeline
+    // [XCDE] perf: the previous draw's pipeline when nothing the key reads changed (g_pipe_state_gen / g_pass_gen).
+    // XCDE_PIPEKEY_MEMO=0: off. XCDE_MEMO_CHECK=1: the key is built anyway and a different pipeline logged.
+    // (the pass part of the key: its formats, compared as values - passes are restarted with the same ones constantly)
+    struct PkPass { uint32_t ncolor, samples; VkFormat color[8], depth, stencil; } pkp = {pass_ncolor, pass_samples, {0}, pass_depth, pass_stencil};
+    memcpy(pkp.color, pass_color, sizeof pkp.color);
+    static struct { Prog *pr; Pipe *pp; uint32_t gen, pass_gen, tab_gen, desc_gen; uint8_t cls; bool valid; struct PkPass ps; } pkm;
+    uint32_t desc_gen = atomic_load_explicit(&g_tex_desc_gen, memory_order_relaxed);
+    static int pkm_on = -1, memo_check = -1;
+    if (pkm_on < 0) { const char *e = getenv("XCDE_PIPEKEY_MEMO"); pkm_on = !e || atoi(e) != 0; memo_check = getenv("XCDE_MEMO_CHECK") != NULL; }
+    bool pk_hit = pkm_on && pkm.valid && pkm.pr == pr && pkm.cls == cls && pkm.gen == g_pipe_state_gen &&
+                  pkm.pass_gen == g_pass_gen && pkm.tab_gen == prog_tab_gen && pkm.desc_gen == desc_gen &&
+                  !memcmp(&pkm.ps, &pkp, sizeof pkp);
     PipeKey k;
+    Pipe *pp = NULL;
+    if (pk_hit) { pp = pkm.pp; memcpy(&k, &pp->k, sizeof k); stat_pipekey_memo++; }
+    if (!pk_hit || memo_check) {
     memset(&k, 0, sizeof k);
     k.prog = pr;
     k.ncolor = pass_ncolor;
@@ -5984,7 +6061,15 @@ static void draw_(CmdRec *r, bool indexed) {
     uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
     if (!ph) ph = 1;
     HEnt *pslot = htab_slot(&pipe_tab, ph);
-    Pipe *pp = pslot->val;
+    if (pk_hit) {  // (XCDE_MEMO_CHECK)
+        if (pslot->val != pp) {
+            static int nmis;
+            if (nmis++ < 50) LOG("[memo-check] pipeline key memo: another pipeline (fs %llx)\n", (unsigned long long)audit_fs());
+            pp = pslot->val;
+            if (!pp) { SKIPPED(); return; }
+        }
+    } else {
+    pp = pslot->val;
     if (!pp) {
         pp = calloc(1, sizeof *pp);
         pp->k = k;
@@ -5998,6 +6083,31 @@ static void draw_(CmdRec *r, bool indexed) {
         if (dump_fs_want() && dump_fs_want() == g_cur_fs_hash) attr_layout_log(&k, dump_fs_want());
     }
     else if (atomic_load(&pp->state) == 3) {  // [XCDE] evicted (pipe_evict): built again, from the warm caches
+        pp->how &= 0x80;
+        atomic_store(&pp->state, 0);
+        atomic_fetch_add(&pp->jobs, 1);
+        run_job(build_pipeline, pp);
+        stat_pipe_rebuilt++;
+    }
+    }  // (not a memo hit)
+    }  // (key built)
+    {   // [XCDE] XCDE_MEMO_WHY=1: the same pipeline as the previous draw without a memo hit - which input moved
+        static int why = -1;
+        static uint32_t hist[96], npass, nprog, n;
+        if (why < 0) why = getenv("XCDE_MEMO_WHY") != NULL;
+        if (why && !pk_hit && pkm.valid && pkm.pp == pp) {
+            if (pkm.pass_gen != g_pass_gen || memcmp(&pkm.ps, &pkp, sizeof pkp)) npass++;
+            else if (pkm.pr != pr || pkm.cls != cls) nprog++;
+            else if (pkm.gen != g_pipe_state_gen) hist[g_pipe_bump_op < 96 ? g_pipe_bump_op : 95]++;
+            if (++n % 20000 == 0) {
+                LOG("[memo-why] %u same-pipeline misses: pass %u, program/class %u, state:", n, npass, nprog);
+                for (int i = 0; i < 96; i++) if (hist[i]) LOG(" op%d=%u", i, hist[i]);
+                LOG("\n");
+            }
+        }
+    }
+    if (!pk_hit) { pkm.desc_gen = desc_gen; pkm.ps = pkp; pkm.pr = pr; pkm.pp = pp; pkm.gen = g_pipe_state_gen; pkm.pass_gen = g_pass_gen; pkm.tab_gen = prog_tab_gen; pkm.cls = cls; pkm.valid = true; }
+    if (atomic_load(&pp->state) == 3) {  // [XCDE] evicted since the memo (pipe_evict): built again
         pp->how &= 0x80;
         atomic_store(&pp->state, 0);
         atomic_fetch_add(&pp->jobs, 1);
@@ -7317,6 +7427,7 @@ static void exec_list(uint64_t handle, int depth) {
                 }
             }
         }
+        if (!cmd_keeps_pipe_key(r->op)) g_pipe_state_gen++, g_pipe_bump_op = r->op;  // [XCDE] (pipeline key memo)
         switch (r->op) {
         case CMD_END: return;
         case CMD_JUMP: p = r->x[0]; continue;
@@ -7325,21 +7436,29 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
             break;
         }
+        // [XCDE] (pipeline key memo) the game sends these before most draws, mostly unchanged: the key's generation only
+        // moves when a value does (STATE_SET: compare, then copy)
+        #define STATE_SET(dst, src, n) do { if (memcmp((dst), (src), (n))) { memcpy((dst), (src), (n)); g_pipe_state_gen++; } } while (0)
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
-        case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
-        case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
-        case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;
+        case CMD_BIND_BLEND: { uint8_t *b = x; STATE_SET(st.blend[b[0] & 7], b, 8); break; }
+        case CMD_BIND_CHANNEL_MASK: STATE_SET(&st.channel_mask, x, 4); break;
+        case CMD_BIND_COLOR: STATE_SET(st.color_state, x, 4); break;
         case CMD_BIND_DEPTH_STENCIL: memcpy(st.ds, x, 8); break;
-        case CMD_BIND_MULTISAMPLE: memcpy(st.ms, x, 0x18); break;
-        case CMD_BIND_POLYGON: memcpy(st.poly, x, 4); break;
-        case CMD_BIND_VERTEX_ATTRIB:
-            st.nattrib = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            memcpy(st.attrib, x, st.nattrib * 4);
+        case CMD_BIND_MULTISAMPLE: STATE_SET(st.ms, x, 0x18); break;
+        case CMD_BIND_POLYGON: STATE_SET(st.poly, x, 4); break;
+        case CMD_BIND_VERTEX_ATTRIB: {
+            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            if (n != st.nattrib) { st.nattrib = n; g_pipe_state_gen++; }
+            STATE_SET(st.attrib, x, n * 4);
             break;
-        case CMD_BIND_VERTEX_STREAM:
-            st.nstream = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            memcpy(st.stream, x, st.nstream * 8);
+        }
+        case CMD_BIND_VERTEX_STREAM: {
+            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            if (n != st.nstream) { st.nstream = n; g_pipe_state_gen++; }
+            STATE_SET(st.stream, x, n * 8);
             break;
+        }
+        #undef STATE_SET
         case CMD_BIND_VERTEX_BUFFERS:
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
             break;
@@ -7349,11 +7468,17 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
-                memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+                if (memcmp(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16)) {  // [XCDE] (cbuf_info memo: on a change)
+                    memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+                    g_sbuf_bind_gen[r->x[0]]++;
+                }
             break;
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
-                memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (memcmp(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8)) {  // [XCDE] (stencil_unit_mask memo: on a change)
+                    memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                    g_tex_bind_gen[r->x[0]]++;
+                }
             break;
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
@@ -7377,7 +7502,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.has_dview = rt->has_dview;
             static int always = -1;
             if (always < 0) always = getenv("LARECOMP_VK_PASS_RESTART") != NULL;
-            if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true;
+            if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true, g_pipe_state_gen++;  // [XCDE] (key memo: on a change)
             break;
         }
         case CMD_SET_VIEWPORTS:
