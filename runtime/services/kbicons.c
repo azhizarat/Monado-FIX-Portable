@@ -137,7 +137,10 @@ static stbtt_fontinfo g_font;
 static unsigned char *g_font_data;
 static bool font_load(void) {
     if (g_font_data) return true;
-    static const char *const fonts[] = {"C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/segoeui.ttf"};
+    static const char *const fonts[] = {"C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/segoeui.ttf",
+                                        // [XCDE] SteamOS / Linux
+                                        "/usr/share/fonts/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+                                        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"};
     for (size_t i = 0; i < sizeof fonts / sizeof *fonts; i++) {
         FILE *f = fopen(fonts[i], "rb");
         if (!f) continue;

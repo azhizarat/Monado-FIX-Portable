@@ -9,7 +9,7 @@ if [ "$(uname -s)" = Linux ]; then
   EXE_SUFFIX=
   # (--allow-shlib-undefined: the system .so files reference the host glibc's newer symbols; the Deck resolves them)
   SYSLIBS="-L${XLIB:-/opt/xlib} -lSDL3 -lshaderc_shared -lvulkan -lopus -lavcodec -lavformat -lavutil -lswscale -lswresample -lz \
-    -lpthread -ldl -lm -Wl,--allow-shlib-undefined -Wl,-rpath,\$ORIGIN"
+    -lpthread -ldl -lm -Wl,--no-gc-sections -Wl,--allow-shlib-undefined -Wl,-rpath,\$ORIGIN"
 else
   PLAT=windows
   PY=.venv/Scripts/python
@@ -21,6 +21,9 @@ else
     $M/lib/libavformat.dll.a $M/lib/libavutil.dll.a $M/lib/libswscale.dll.a $M/lib/libswresample.dll.a $M/lib/libz.a -lwinmm -ldbghelp \
     -Wl,--stack,268435456"
 fi
+# CPU code generation, both hosts: the x86-64-v2 / -O1 upstream validated the lifted code with (-O2 / x86-64-v3 measured
+# no gain on the Steam Deck: its render thread is bound by memory and driver calls). XCDE_CPU="..." overrides.
+CPU=${XCDE_CPU:-"-O1 -march=x86_64_v2"}
 XINCF=; [ $PLAT = linux ] && XINCF="-I$INC"  # (Windows boot objects never saw the MSYS2 headers)
 ZCC="$PY -m ziglang cc $TGT"
 ZCXX="$PY -m ziglang c++ $TGT"

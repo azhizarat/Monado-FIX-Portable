@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")/.."
 . scripts/plat.sh; Z="$ZCC"; export Z
-CF="-O1 -march=x86_64_v2 -ffp-contract=off -fno-strict-aliasing -fvisibility=hidden -Iruntime $XINCF -w"; export CF
+CF="$CPU -ffp-contract=off -fno-strict-aliasing -fvisibility=hidden -Iruntime $XINCF -w"; export CF
 mkdir -p build/obj/main build/obj/sdk build/rt
 # drop objects whose chunk no longer exists (the chunk layout shifts when the generator output changes)
 for o in build/obj/*/*.o; do m=$(basename "$(dirname "$o")"); b=$(basename "$o" .o); [ -f "generated/$m/$b.c" ] || rm -f "$o"; done

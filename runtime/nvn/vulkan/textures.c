@@ -660,11 +660,18 @@ static uint64_t hash_full(const uint8_t *p, uint64_t n) {
     return h ^ (h >> 31);
 }
 
+// The quick "did it change?" check before a full hash. [XCDE] perf: whole 64-byte lines at 64 evenly spaced places
+// (was 4,096 single bytes: 4,096 cache misses per check, ~8 % of the render thread on the Steam Deck with ~2,700
+// checks a second). The same 4 KB is read; the periodic full hash stays the safety net. Values only compared in a run.
 static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
-    uint64_t h = 1469598103934665603ull;
-    uint64_t step = n > 4096 ? n / 4096 : 1;
-    for (uint64_t i = 0; i < n; i += step) { h ^= p[i]; h *= 1099511628211ull; }
-    return h ^ n;
+    if (n <= 4096) return hash_full(p, n);
+    uint64_t h = 1469598103934665603ull ^ n, step = (n / 64) & ~63ull;
+    for (uint64_t i = 0, k = 0; k < 64; k++, i += step) {
+        uint64_t v[8];
+        memcpy(v, p + i, 64);
+        for (int j = 0; j < 8; j++) { h = (h ^ v[j]) * 0x100000001B3ull; h ^= h >> 29; }
+    }
+    return h;
 }
 
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;

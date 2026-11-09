@@ -103,12 +103,21 @@ static void log_to_file_without_terminal(void) {
 
 #if defined(__x86_64__)
 #include <cpuid.h>
-// [XCDE] Monado builds for x86-64-v2 (scripts/build_*.sh: -march=x86_64_v2), like the Windows check: SSE4.2 + POPCNT.
+// [XCDE] The CPU level this binary was built for (scripts/plat.sh CPU: Linux x86-64-v3 = AVX2 / FMA / BMI2, else
+// x86-64-v2 = SSE4.2 / POPCNT): say so instead of crashing with an illegal instruction.
 // (cpuid directly: zig's compiler-rt answers __builtin_cpu_supports with zeros, which stopped a Zen 2 Steam Deck.)
 static void require_cpu(void) {
-    unsigned a, b, c, d;
-    if (__get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSE4_2) && (c & bit_POPCNT)) return;
+    unsigned a, b, c, d, b7 = 0, c7 = 0, d7 = 0;
+    bool v2 = __get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSE4_2) && (c & bit_POPCNT);
+#ifdef __AVX2__
+    bool fma = c & bit_FMA;
+    __get_cpuid_count(7, 0, &a, &b7, &c7, &d7);
+    if (v2 && fma && (b7 & bit_AVX2) && (b7 & bit_BMI2)) return;
+    fprintf(stderr, "FATAL: this Monado build needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Zen or newer).\n");
+#else
+    if (v2) return;
     fprintf(stderr, "FATAL: Monado needs a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer / 2011 or newer).\n");
+#endif
     exit(1);
 }
 #else

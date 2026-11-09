@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <mutex>
+#include <stdio.h>
 #include <string.h>
 
 #include "imgui.h"
@@ -370,8 +371,18 @@ extern "C" void menu_render(void *cmd, uint32_t w, uint32_t h) {
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
         io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
         font_h = fmaxf(16.0f, h / 1080.0f * 22.0f);
-        if (!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", font_h, nullptr, io.Fonts->GetGlyphRangesDefault()))
-            io.Fonts->AddFontDefault();
+        // [XCDE] the first font that exists (Windows; then SteamOS / Linux: Noto Sans, DejaVu Sans), else ImGui's own
+        static const char *const fonts[] = {"C:\\Windows\\Fonts\\segoeui.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                                            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"};
+        ImFont *font = nullptr;
+        for (const char *f : fonts) {
+            FILE *fp = fopen(f, "rb");
+            if (!fp) continue;
+            fclose(fp);
+            if ((font = io.Fonts->AddFontFromFileTTF(f, font_h, nullptr, io.Fonts->GetGlyphRangesDefault()))) break;
+        }
+        if (!font) io.Fonts->AddFontDefault();
         monado_theme(font_h / 16.0f);
         if (!vk_imgui_backend_init()) { ImGui::DestroyContext(ctx); ctx = nullptr; open_ = false; return; }
         ImGui_ImplVulkan_CreateFontsTexture();

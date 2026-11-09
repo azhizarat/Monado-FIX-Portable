@@ -2618,6 +2618,20 @@ static uint64_t hmix(uint64_t h, const void *p, size_t n) {
     return h;
 }
 
+// [XCDE] perf: hmix of a fragment program's code (fs + 0x30, 0x200 bytes: the hash the skip / depth-of-field lists
+// compare against), remembered per code address. hmix runs a byte at a time (~1,500 cycles); the program changes
+// between most draws (~6 % of the render thread on the Steam Deck). An entry also keeps the first 16 code bytes, so a
+// program loaded later at the same address gets hashed again. (Render thread only.)
+static uint64_t fs_code_hash(uint64_t fs) {
+    if (!fs) return 0;
+    static struct { uint64_t fs, head[2], hash; } tab[4096];
+    const uint64_t *code = (const uint64_t *)(uintptr_t)(fs + 0x30);
+    typeof(tab[0]) *e = &tab[(fs >> 4) & 4095];
+    if (e->fs == fs && e->head[0] == code[0] && e->head[1] == code[1]) return e->hash;
+    e->fs = fs; e->head[0] = code[0]; e->head[1] = code[1];
+    return e->hash = hmix(1469598103934665603ull, code, 0x200);
+}
+
 static VkPrimitiveTopology topo_class_base(uint8_t c) {
     return c == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : c == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
@@ -5416,7 +5430,7 @@ static NvnTexture *thumbnail_target(void) {
     NvnTexture *t = st.rt.color[0];
     if (t->width != 320 || t->height != 180 || t->format != 0x25) return NULL;
     uint64_t fs = st.program->stages[1].code_addr;
-    uint64_t h = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+    uint64_t h = fs_code_hash(fs);
     static uint64_t want = 1;
     if (want == 1) want = getenv("XCDE_THUMB_FS") ? strtoull(getenv("XCDE_THUMB_FS"), NULL, 16) : 0xb515bb7fd9974090ull;
     static int logged;
@@ -5534,7 +5548,7 @@ static void slot_thumb_fix(void) {
     NvnTexture *t = st.rt.color[0];
     if (t->width != 320 || t->height != 180 || t->format != 0x25) return;
     uint64_t fs = st.program->stages[1].code_addr;
-    if (!fs || hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) != 0x93ee0aecfbae2ac9ull) return;
+    if (!fs || fs_code_hash(fs) != 0x93ee0aecfbae2ac9ull) return;
     uint64_t a = st.sbuf[1][0].addr, off = st.sbuf[0][2].addr;
     const uint64_t sz = 320 * 180 * 3;
     if (a < HEAP_BASE || st.sbuf[1][0].size < sz || off < HEAP_BASE || st.sbuf[0][2].size < 8) return;
@@ -5652,7 +5666,7 @@ static void draw_(CmdRec *r, bool indexed) {
         uint64_t fs = st.program->stages[1].code_addr;
         if (fs != last_fs) {
             last_fs = fs;
-            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+            last_hash = fs_code_hash(fs);
         }
         if (g_nskipfs < 0) {
             g_nskipfs = 0;
