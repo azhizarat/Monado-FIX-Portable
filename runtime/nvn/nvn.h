@@ -105,7 +105,9 @@ typedef struct {
     uint64_t callback, callback_data;
     bool recording;
     uint64_t guest;  // the guest NVNcommandBuffer*
+    uint32_t sync_cmds;  // [XCDE] fence / call records in the list being recorded (exec.c scan_fences skips lists without)
 } NvnCmdBuf;
+int nvn_list_sync_cmds(uint64_t handle);  // [XCDE] that count for a list EndRecording returned, -1: not known
 
 // One recorded command: header, the call's integer and float arguments, then copied data.
 typedef struct {

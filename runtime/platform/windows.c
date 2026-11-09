@@ -269,14 +269,25 @@ static void log_to_file_without_console(void) {
     _putenv("LASRECOMP_LOG_APPEND=1");
 }
 
-// [XCDE] The recompiled game code is built for x86-64-v2 (SSE4.2) by default; say so instead of crashing with an
-// illegal instruction on an older CPU. (Uses CPUID directly: __builtin_cpu_init needs compiler-rt's cpu model.)
+// [XCDE] The CPU level this build targets (scripts/plat.sh CPU: x86-64-v3 = AVX2 / FMA / BMI2 by default, x86-64-v2 =
+// SSE4.2 / POPCNT with XCDE_CPU): say so instead of crashing with an illegal instruction on an older CPU.
+// (Uses CPUID directly: __builtin_cpu_init needs compiler-rt's cpu model.)
 #include <cpuid.h>
 static void require_cpu(void) {
     unsigned a, b, c, d;
-    if (__get_cpuid(1, &a, &b, &c, &d) && (c & (1u << 20)) /* SSE4.2 */ && (c & (1u << 23)) /* POPCNT */) return;
+    bool v2 = __get_cpuid(1, &a, &b, &c, &d) && (c & (1u << 20)) /* SSE4.2 */ && (c & (1u << 23)) /* POPCNT */;
+#ifdef __AVX2__
+    bool fma = c & (1u << 12);
+    unsigned b7 = 0, c7, d7;
+    __get_cpuid_count(7, 0, &a, &b7, &c7, &d7);
+    if (v2 && fma && (b7 & (1u << 5)) /* AVX2 */ && (b7 & (1u << 8)) /* BMI2 */) return;
+    MessageBoxA(NULL, "This Monado build needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Zen or newer).\n"
+                "Build with XCDE_CPU=\"-O1 -march=x86_64_v2\" for older CPUs.", "Monado", MB_ICONERROR | MB_OK);
+#else
+    if (v2) return;
     MessageBoxA(NULL, "Monado needs a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer / 2011 or newer).",
                 "Monado", MB_ICONERROR | MB_OK);
+#endif
     ExitProcess(1);
 }
 

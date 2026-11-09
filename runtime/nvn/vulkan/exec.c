@@ -2043,6 +2043,7 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 
 static uint64_t hmix(uint64_t h, const void *p, size_t n);
 static uint64_t fs_code_hash(uint64_t fs);
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("LARECOMP_SAVE_MSL")) return;
     mkdir("build/glsl", 0755);
@@ -2311,8 +2312,7 @@ static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { h ^= (uint64_t)(np->stages[i].code_addr != 0); h *= 0x100000001B3ull; }
     for (int i = 0; i < 3; i++) { h ^= np->stages[i].code_hash; h *= 0x100000001B3ull; }
-    const uint8_t *vb = (const uint8_t *)vkey;
-    for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
+    h = hash_words(h, vkey, sizeof *vkey);  // [XCDE] perf (was a byte at a time; the program table is in memory only)
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
     for (int k = 0; k < 4; k++) { h ^= (fkey->tex_uint >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; }  // [XCDE]
     if (fkey->alpha_func) { h ^= fkey->alpha_func | (uint64_t)fkey->alpha_ref << 8; h *= 0x100000001B3ull; }  // (T191: only then)
@@ -2622,8 +2622,23 @@ static void pipe_key_canon(PipeKey *k) {
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
 // stored constants (fragment-shader hashes) and must not change.
+// [XCDE] perf: four independent lanes over 32-byte steps (one serial multiply chain was ~2.6 % of the render thread
+// in Colony 9 on the Steam Deck: the ~700-byte pipeline key every draw). Only in-memory tables use these values
+// (variants.bin keeps the records and re-hashes them on load).
 static uint64_t hash_words(uint64_t h, const void *p, size_t n) {
     const uint8_t *b = p;
+    if (n >= 32) {
+        uint64_t h1 = h ^ 0xC2B2AE3D27D4EB4Full, h2 = h ^ 0x165667B19E3779F9ull, h3 = h ^ 0x27D4EB2F165667C5ull;
+        for (; n >= 32; n -= 32, b += 32) {
+            uint64_t v[4];
+            memcpy(v, b, 32);
+            h = (h ^ v[0]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+            h1 = (h1 ^ v[1]) * 0x9E3779B97F4A7C15ull; h1 ^= h1 >> 29;
+            h2 = (h2 ^ v[2]) * 0x9E3779B97F4A7C15ull; h2 ^= h2 >> 29;
+            h3 = (h3 ^ v[3]) * 0x9E3779B97F4A7C15ull; h3 ^= h3 >> 29;
+        }
+        h ^= h1 * 0xC2B2AE3D27D4EB4Full ^ h2 * 0x165667B19E3779F9ull ^ h3 * 0x27D4EB2F165667C5ull;
+    }
     for (; n >= 8; n -= 8, b += 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
     for (; n; n--, b++) { h = (h ^ *b) * 0x100000001B3ull; }
     return h ^ (h >> 32);
@@ -7777,6 +7792,7 @@ void backend_drain(void) {
 // the fences a list sets (CMD_FENCE_SYNC with a sync object), through its jumps and calls
 static void scan_fences(uint64_t handle, uint64_t ticket, int depth) {
     extern void nvn_sync_mark(uint64_t guest, uint64_t ticket);
+    if (nvn_list_sync_cmds(handle) == 0) return;  // [XCDE] perf: no fence / call recorded in it (cmdbuf.c)
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;

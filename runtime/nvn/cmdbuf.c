@@ -113,12 +113,21 @@ static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
     }
     CmdRec *r = raw_rec(cb->mem + cb->used, op, size);
     cb->used += size;
+    if (op == CMD_FENCE_SYNC || op == CMD_CALL) cb->sync_cmds++;  // [XCDE] (nvn_list_sync_cmds)
     return r;
+}
+// [XCDE] perf: lists by start address -> how many fence / call records they hold, so the render queue's fence scan
+// (exec.c scan_fences, every command of every submitted list: ~3 % of the game thread in Colony 9) skips lists with none.
+static struct { uint64_t start; uint32_t n; } list_sync[4096];
+int nvn_list_sync_cmds(uint64_t handle) {
+    unsigned i = (unsigned)(handle >> 3) & 4095;
+    return list_sync[i].start == handle ? (int)list_sync[i].n : -1;
 }
 
 NVN(nvnCommandBufferBeginRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     cb->recording = true;
+    cb->sync_cmds = 0;
     rec(c, cb, CMD_BARRIER, 0);  // makes sure memory exists; the list starts here
     cb->start = cb->mem + cb->used - sizeof(CmdRec);
 }
@@ -126,6 +135,7 @@ NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     rec(c, cb, CMD_END, 0);
     cb->recording = false;
+    { unsigned i = (unsigned)(cb->start >> 3) & 4095; list_sync[i].start = cb->start; list_sync[i].n = cb->sync_cmds; }  // [XCDE]
     RET(cb->start);
 }
 NVN(nvnCommandBufferIsRecording) { RET(cb_of(A(0))->recording); }

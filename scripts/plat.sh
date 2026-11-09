@@ -21,9 +21,10 @@ else
     $M/lib/libavformat.dll.a $M/lib/libavutil.dll.a $M/lib/libswscale.dll.a $M/lib/libswresample.dll.a $M/lib/libz.a -lwinmm -ldbghelp \
     -Wl,--stack,268435456"
 fi
-# CPU code generation, both hosts: the x86-64-v2 / -O1 upstream validated the lifted code with (-O2 / x86-64-v3 measured
-# no gain on the Steam Deck: its render thread is bound by memory and driver calls). XCDE_CPU="..." overrides.
-CPU=${XCDE_CPU:-"-O1 -march=x86_64_v2"}
+# CPU code generation, both hosts: x86-64-v3 (AVX2 / FMA: the lifted code's fmaf() becomes one
+# instruction instead of compiler-rt's software FMA, ~3.4 % of the game thread in Colony 9) and -O2. For CPUs before
+# Haswell / Zen: XCDE_CPU="-O1 -march=x86_64_v2" (the old default; the startup check follows the level).
+CPU=${XCDE_CPU:-"-O2 -march=x86_64_v3"}
 XINCF=; [ $PLAT = linux ] && XINCF="-I$INC"  # (Windows boot objects never saw the MSYS2 headers)
 ZCC="$PY -m ziglang cc $TGT"
 ZCXX="$PY -m ziglang c++ $TGT"
