@@ -4374,6 +4374,7 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
 }
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
+static bool tmp_invfix_patch(int idx, uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);  // (with tmp_draw)
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     // [XCDE] perf: a graphics stage's driver constant buffer is built from its bound storage buffers only: the same
@@ -4469,6 +4470,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         return ubo_span(s, size);
     }
     if (size < 16) size = 16;
+    {   VkDescriptorBufferInfo fx;  // [XCDE] (tmp_draw / invfix_find) a jitter-consistent copy of the inverse camera matrix
+        if (stage == 0 && tmp_invfix_patch(idx, r.addr, size, &fx)) return fx; }
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
@@ -5777,6 +5780,67 @@ static bool tmp_cam_check(const float *f, TmpCamera *c) {
     return true;
 }
 static bool tmp_dm1 = true;          // the scene draws' NVN depth mode (clip z in [-1, 1])
+// [XCDE] Jitter-consistent screen passes. The scene's draws are jittered by shifting their viewport. The game's
+// fullscreen passes over the G-buffer (deferred lighting b23065ee, ...) rebuild each pixel's position from an inverse
+// camera matrix in their vertex constant buffer (v0 = M * clip of the quad) and read the G-buffer at the quad's UV.
+// Jittered with the rest (they test the scene depth), their UVs moved by the jitter too: each pixel read a blend of
+// G-buffer texels whose weights followed the jitter sequence - the "vibration" FSR 3 showed at low render sizes (gone
+// with XCDE_TMP_NOJITTER=1). Now such a pass (a vertex constant buffer holding M = inverse(view-projection) or
+// inverse(projection), found once per vertex program: M x VP = identity) of a scene-sized target is not jittered, and
+// the snapshot of that buffer gets M * T(-jitter): pixel p reads its own texel and gets the ray of p - jitter, where the
+// jittered geometry in that texel is. XCDE_TMP_INVFIX=0: off (jittered as before); XCDE_TMP_INVFIX_LOG=1: what was
+// found per program; XCDE_TMP_INVFIX_YSIGN=-1: the other y sign (tests).
+static struct { bool on; int idx; uint32_t off; float jx, jy; } g_invfix;  // (cbuf_info, vertex stage: patch buffer idx at off)
+static bool tmp_flip_y;  // the scene draws' vertex output y flip (translate.c: gl_Position.y = -y)
+static bool invfix_is_inverse(const float *m, const float *a) {  // rows: m x a = identity
+    for (int i = 0; i < 16; i++) if (!(m[i] == m[i]) || fabsf(m[i]) > 1e30f) return false;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += m[i * 4 + k] * a[k * 4 + j];
+            if (fabsf(s - (i == j ? 1.0f : 0.0f)) > 2e-3f) return false;
+        }
+    return true;
+}
+static int invfix_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XCDE_TMP_INVFIX"); on = !(e && *e == '0'); }
+    return on;
+}
+// this draw is a screen pass of the scene frame with an inverse camera matrix: its vertex buffer index / offset (false: no)
+static bool invfix_find(int *idx, uint32_t *off) {
+    static int lg = -1;
+    if (lg < 0) lg = getenv("XCDE_TMP_INVFIX_LOG") != NULL;
+    if (!invfix_on() || !tmp_cam.ok || !tmp_depth_tex || !st.program) return false;
+    if (!st.rt.ncolor || !st.rt.color[0] || st.rt.color[0]->width != tmp_depth_tex->width || st.rt.color[0]->height != tmp_depth_tex->height)
+        return false;  // (only scene-sized targets: shadow maps and other views may hold the camera's inverse too)
+    typedef struct { uint64_t vs; int16_t idx; uint16_t off; } InvEnt;
+    enum { INV_N = 8192 };  // (open addressing; a full table just stops caching new programs - they scan each time)
+    static InvEnt cache[INV_N];
+    uint64_t vs = st.program->stages[0].code_hash ? st.program->stages[0].code_hash : st.program->stages[0].code_addr;
+    if (!vs) vs = 1;
+    InvEnt *e = NULL, tmp_e = {0};
+    for (uint32_t i = (uint32_t)(vs ^ (vs >> 29)) & (INV_N - 1), n = 0; n < 64; i = (i + 1) & (INV_N - 1), n++)
+        if (cache[i].vs == vs || !cache[i].vs) { e = &cache[i]; break; }
+    if (!e) e = &tmp_e;
+    if (e->vs != vs) {
+        e->vs = vs; e->idx = -1; e->off = 0;
+        for (int k = 0; k < 14 && e->idx < 0; k++) {
+            const Range *u = &st.ubuf[0][k];
+            if (u->addr < HEAP_BASE || u->size < 64) continue;
+            uint64_t lim = u->size < 1024 ? u->size : 1024;
+            for (uint64_t o = 0; o + 64 <= lim; o += 16) {
+                const float *m = (const float *)(uintptr_t)(u->addr + o);
+                if (invfix_is_inverse(m, tmp_cam.viewproj) || invfix_is_inverse(m, tmp_cam.proj)) { e->idx = (int16_t)k; e->off = (uint16_t)o; break; }
+            }
+        }
+        if (lg) LOG("[tmp] invfix: vs %016llx fs %016llx: %s (buffer %d, offset %u)\n", (unsigned long long)vs,
+                    (unsigned long long)st.program->stages[1].code_hash, e->idx >= 0 ? "inverse camera matrix" : "none", e->idx, e->off);
+    }
+    if (e->idx < 0) return false;
+    *idx = e->idx; *off = e->off;
+    return true;
+}
 static void tmp_draw(const Prog *pr, float *jx, float *jy) {
     uint64_t fr = renderer_present_count();
     if (fr != tmp_frame) {
@@ -5789,7 +5853,7 @@ static void tmp_draw(const Prog *pr, float *jx, float *jy) {
         for (int k = 0; k < 14; k++) {
             const Range *u = &st.ubuf[0][k];
             if (u->addr < HEAP_BASE || u->size < 176) continue;
-            if (tmp_cam_check((const float *)(uintptr_t)u->addr, &tmp_cam)) { tmp_depth_tex = st.rt.depth; tmp_dm1 = pr->vkey.depth_minus_one; break; }
+            if (tmp_cam_check((const float *)(uintptr_t)u->addr, &tmp_cam)) { tmp_depth_tex = st.rt.depth; tmp_dm1 = pr->vkey.depth_minus_one; tmp_flip_y = pr->vkey.flip_y; break; }
         }
     // (the same image: the game draws its prepass and colour passes through different texture objects over one depth)
     TexBackend *db = st.rt.depth->backend, *sb = tmp_depth_tex ? tmp_depth_tex->backend : NULL;
@@ -5819,6 +5883,21 @@ static void tmp_draw(const Prog *pr, float *jx, float *jy) {
         }
     }
     if (scene && world && !nojit && !tmp_hud_started()) { *jx = tmp_jit[0]; *jy = tmp_jit[1]; tmp_scene_frame = fr; }
+    g_invfix.on = false;
+    {   int ix; uint32_t io;  // [XCDE] (jitter-consistent screen passes, above) no viewport jitter; the inverse matrix takes it
+        if (!nojit && !tmp_hud_started() && tmp_frame == fr && invfix_find(&ix, &io)) {
+            *jx = *jy = 0;
+            static float ysign = 0;
+            if (ysign == 0) { const char *e = getenv("XCDE_TMP_INVFIX_YSIGN"); ysign = e && atoi(e) < 0 ? -1.0f : 1.0f; }
+            // the scene draws' jitter in guest clip units: x right = +2 jx / width; y: the viewport is flipped (set_viewport),
+            // so +jy pixels down is -2 jy / height in Vulkan NDC, the negative of that in the guest's when its output is flipped
+            TexBackend *db = tmp_depth_tex->backend;
+            float w = (float)(db && db->width ? db->width : 1), h = (float)(db && db->height ? db->height : 1);
+            g_invfix.on = true; g_invfix.idx = ix; g_invfix.off = io;
+            g_invfix.jx = 2.0f * tmp_jit[0] / w;
+            g_invfix.jy = ysign * (tmp_flip_y ? 2.0f : -2.0f) * tmp_jit[1] / h;
+        }
+    }
     if (getenv("XCDE_TMP_LOG")) {  // (debugging) per frame: draws jittered / scene draws not jittered (after the HUD began) / others
         static uint64_t fr; static int nj, nh, no, nl;
         if (fr != renderer_present_count()) {
@@ -5912,6 +5991,16 @@ static void draw(CmdRec *r, bool indexed) {
     draw_(r, indexed);
     if (thumb) writeback_texture(thumb);
     PROF_ADD(prof_draw);
+}
+// (cbuf_info) the vertex stage's buffer idx snapshot with the inverse matrix's rows taking the jitter out: M' = M * T(-J)
+static bool tmp_invfix_patch(int idx, uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    if (!g_invfix.on || idx != g_invfix.idx || g_invfix.off + 64 > size) return false;
+    VkSpan s = vk_transient(size, 256);
+    memcpy(s.ptr, (const void *)(uintptr_t)addr, size);
+    float *m = (float *)((uint8_t *)s.ptr + g_invfix.off);
+    for (int i = 0; i < 4; i++) m[i * 4 + 3] -= m[i * 4 + 0] * g_invfix.jx + m[i * 4 + 1] * g_invfix.jy;
+    *out = ubo_span(s, size);
+    return true;
 }
 static uint64_t prof_tp_;
 // [XCDE] (skinning / overlap study) XCDE_SKIN_TRACE=<presented frame> (0: the frame after build/skin_now appears):
@@ -6461,8 +6550,11 @@ static void draw_(CmdRec *r, bool indexed) {
         if (g_debug_frame) LOG("[xfb] vs %llx -> %llx (+%llu bytes, %u x %u, stride %u)\n", (unsigned long long)st.program->stages[0].code_addr,
                                (unsigned long long)at, (unsigned long long)bytes, xcount, xinst, vkey.xfb_stride);
     }
+    float jx = 0, jy = 0;
+    if (tmp_enabled()) tmp_draw(pr, &jx, &jy);  // [XCDE] temporal upscaling: camera, scene depth, jitter (+ g_invfix)
     PROF_T0();
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
+    g_invfix.on = false;
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
@@ -6528,8 +6620,6 @@ static void draw_(CmdRec *r, bool indexed) {
             vp_oy = (ph - st.rt.color[0]->height * u) * 0.5f;
         }
     }
-    float jx = 0, jy = 0;
-    if (tmp_enabled()) tmp_draw(pr, &jx, &jy);  // [XCDE] temporal upscaling: the camera, the scene depth, jitter
     if (tmp_enabled()) {  // [XCDE] T215: the game's velocity buffer (gTVelocity of its temporal AA / AO / shadow passes)
         // read at the gTVelocity unit of the game's own readers, found by their code hashes (container names,
         // tools/spch_attrs.py + the SPCH layout). Written in the G-buffer pass, also with the game's AA off.
