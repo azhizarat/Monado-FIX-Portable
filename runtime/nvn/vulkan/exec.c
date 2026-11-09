@@ -65,7 +65,8 @@ static int prof = -1;
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
 // [XCDE] (LARECOMP_VK_PROF) "pre" in parts: 0 prewarm + shader key + program, 1 fs hash / skips / debug, 2 T192 + feedback +
 // snapshot invalidation, 3 barriers / epochs, 4 command buffer (begin_pass) + topology
-static uint64_t prof_pre_part[5], prof_pp_, stat_pipekey_memo;  // (+ draws that reused the previous pipeline)
+static uint64_t prof_pre_part[5], prof_pp_, stat_pipekey_memo;
+static uint64_t prof_ds_alloc, prof_ds_upd, stat_ds_writes, prof_bp, prof_bp_submit;  // [XCDE] (stage_set: set allocation / vkUpdateDescriptorSets ns, writes)  // (+ draws that reused the previous pipeline)
 #define PRE_MARK(i) do { if (prof) { uint64_t n_ = SDL_GetTicksNS(); prof_pre_part[i] += n_ - prof_pp_; prof_pp_ = n_; } } while (0)
 static VkQueryPool prof_qp;
 static uint64_t prof_same_pipe, prof_same_prog;  // (profiler: draws repeating the previous draw's program / pipeline)
@@ -1314,6 +1315,10 @@ const char *renderer_stats(void) {
                  prof_pre_part[0] / 1e6, prof_pre_part[1] / 1e6, prof_pre_part[2] / 1e6, prof_pre_part[3] / 1e6, prof_pre_part[4] / 1e6,
                  (unsigned long long)stat_pipekey_memo);
         stat_pipekey_memo = 0;
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | sets: alloc %.0f update %.0f ms, %llu writes | begin_pass %.0f (submit %.0f) ms",
+                 prof_ds_alloc / 1e6, prof_ds_upd / 1e6, (unsigned long long)stat_ds_writes, prof_bp / 1e6, prof_bp_submit / 1e6);
+        prof_ds_alloc = prof_ds_upd = stat_ds_writes = prof_bp = prof_bp_submit = 0;
         extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | tex checks %llu samples %llu full %llu (%.1f MB, dynamic %llu)",
@@ -1756,7 +1761,9 @@ static void begin_pass(void) {
     if (split_pending) {  // [XCDE] perf: the split submission goes here, where the game's pass ends anyway
         split_pending = false;
         split_since = 0;
+        uint64_t ps0 = prof ? SDL_GetTicksNS() : 0;
         renderer_submit();
+        if (prof) prof_bp_submit += SDL_GetTicksNS() - ps0;
         was_in_pass = false;  // (a new command buffer: full barrier, as at any submission start)
     }
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
@@ -5401,9 +5408,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     if (enabled && xcde_descriptor_match(entry,seq,lid,keys,(unsigned)n)) {
         metric_desc_hits++; return (VkDescriptorSet)(uintptr_t)entry->handle;
     }
+    uint64_t pt0 = prof ? SDL_GetTicksNS() : 0;
     ds=vk_alloc_set(layout);
+    uint64_t pt1 = prof ? SDL_GetTicksNS() : 0;
     for (int i=0;i<n;i++) w[i].dstSet=ds;
-    if (n) { vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL); metric_desc_updates++; }
+    if (n) { vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL); metric_desc_updates++; stat_ds_writes += (uint64_t)n; }
+    if (prof) { uint64_t pt2 = SDL_GetTicksNS(); prof_ds_alloc += pt1 - pt0; prof_ds_upd += pt2 - pt1; }
     if (enabled) {
         entry->sequence=seq; entry->layout=lid; entry->handle=(uint64_t)(uintptr_t)ds; entry->count=(unsigned)n;
         memcpy(entry->key,keys,(size_t)n*sizeof *keys);
@@ -5950,7 +5960,9 @@ static void draw_(CmdRec *r, bool indexed) {
             !tmp_hud_started() && pass_draws >= 1 && last_pass_seq == pass_seq_no)
             RT_DIRTY();
         if (last_pass_seq != pass_seq_no || st.rt_dirty || !in_pass) pass_draws = 0;
+        uint64_t pb0 = prof ? SDL_GetTicksNS() : 0;
         begin_pass();
+        if (prof) prof_bp += SDL_GetTicksNS() - pb0;
         last_pass_seq = pass_seq_no;
         pass_draws++;
     }
