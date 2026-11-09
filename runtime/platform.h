@@ -32,6 +32,15 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi);
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page);
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
+// [XCDE] CPU/GPU overlap study (Linux; no-ops elsewhere): page ranges the GPU of the last recorded frame reads (prot
+// PLAT_PROT_READ) or writes (PLAT_PROT_NONE) are protected; CPU accesses to them fault, are counted and let through.
+void plat_ov_protect(const uint64_t *lo, const uint64_t *hi, const uint8_t *gpu_writes, int n, uint64_t seq);  // seq 0: stats
+void plat_ov_release_prev(void);                       // (wait mode) the previous frame's GPU work is done
+void plat_ov_set_gpu_done(uint64_t (*fn)(void));       // the timeline's completed sequence (wait mode)
+void plat_ov_frame_start(void);                        // the CPU starts its next frame now (fault times count from here)
+void plat_ov_guest_write(uint64_t addr, uint64_t size);  // a syscall is about to write guest memory: open those pages
+void plat_ov_set_worker(void);                         // the calling thread is the render worker
+void plat_ov_report(void);                             // logs the counters of the last report period
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)
 
 // ---- time

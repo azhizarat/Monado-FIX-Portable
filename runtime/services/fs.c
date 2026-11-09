@@ -295,6 +295,7 @@ static void rom_index(int fd) {
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
 static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
+    plat_ov_guest_write((uint64_t)(uintptr_t)dst, size);  // [XCDE] (XCDE_OVERLAP_STATS: the kernel can't fault on it)
     if (!ov_n) return pread(fd, dst, size, (off_t)off);
     uint64_t done = 0;
     while (done < size) {
@@ -441,6 +442,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
         IpcBuf *b = out_buf(req, 0);
         if ((uint64_t)size > b->size) size = (int64_t)b->size;
+        plat_ov_guest_write(b->addr, (uint64_t)size);  // [XCDE] (XCDE_OVERLAP_STATS)
         ssize_t n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
         if (n < 0) { resp->result = errno_result(); LOG("[asset] read failed: %s offset=%lld bytes=%lld errno=%d\n", f->path, (long long)off, (long long)size, errno); }
         else if (!f->save && getenv("XCDE_ASSET_TRACE")) LOG("[asset] read: %s offset=%lld requested=%lld read=%lld\n", f->path, (long long)off, (long long)size, (long long)n);

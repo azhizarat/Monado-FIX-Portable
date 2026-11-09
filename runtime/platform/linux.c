@@ -203,8 +203,125 @@ void plat_print_backtrace(void) {
     }
 }
 
+// ---- [XCDE] CPU/GPU overlap (exec.c XCDE_OVERLAP_STATS / XCDE_OVERLAP): the pages the GPU of a recorded frame reads
+// (PROT_READ) or writes (PROT_NONE) are protected; a CPU access faults. Stats mode: counted (who, read / write, ms into
+// the CPU's next frame) and let through. Wait mode (one frame in flight): the access first waits until the GPU has
+// finished that frame (its submission sequence on the timeline, through the callback exec.c registers: a plain counter
+// query, no lock), so the CPU never changes what the GPU still reads nor reads what it hasn't written yet.
+// Two sets are live: the previous frame's (released once the game has waited for it) and the current one. Sets are
+// sorted runs (the handler bisects) in a ring of three buffers, so a handler never reads one being rewritten.
+#define OV_MAX 65536
+typedef struct { uint64_t lo[OV_MAX], hi[OV_MAX]; uint8_t w[OV_MAX]; int n; uint64_t seq; } OvSet;
+static OvSet ov_sets[3];
+static OvSet *volatile ov_cur, *volatile ov_prev;
+static uint64_t (*volatile ov_gpu_done)(void);
+static volatile uint64_t ov_t0;  // CLOCK_MONOTONIC ns of the CPU's frame start
+static volatile pid_t ov_worker;
+// counters: [gpu-writes page? 1:0][cpu write? 1:0][worker? 1:0][time bucket: <4, 4-10, 10-17, >=17 ms]
+static volatile uint32_t ov_cnt[2][2][2][4], ov_sys, ov_frames, ov_pages_sum, ov_runs_sum, ov_waits;
+static volatile uint64_t ov_prot_ns, ov_wait_ns;
+static uint64_t ov_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+static int ov_find(const OvSet *o, uint64_t a) {
+    int lo = 0, hi = o->n - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) >> 1;
+        if (a < o->lo[m]) hi = m - 1;
+        else if (a >= o->hi[m]) lo = m + 1;
+        else return m;
+    }
+    return -1;
+}
+static bool ov_fault(uint64_t fa, bool write) {
+    const OvSet *c = __atomic_load_n(&ov_cur, __ATOMIC_ACQUIRE), *p = __atomic_load_n(&ov_prev, __ATOMIC_ACQUIRE), *o = NULL;
+    int r = -1;
+    if (c && (r = ov_find(c, fa)) >= 0) o = c;  // (the current frame first: its sequence is the later one)
+    else if (p && (r = ov_find(p, fa)) >= 0) o = p;
+    if (!o) return false;
+    uint64_t t = ov_now(), ms = (t - ov_t0) / 1000000ull;
+    int bk = ms < 4 ? 0 : ms < 10 ? 1 : ms < 17 ? 2 : 3;
+    __atomic_add_fetch(&ov_cnt[o->w[r]][write][gettid() == ov_worker][bk], 1, __ATOMIC_RELAXED);
+    uint64_t (*done)(void) = ov_gpu_done;
+    if (o->seq && done && done() < o->seq) {  // wait mode: until the GPU has finished that frame
+        while (done() < o->seq) sched_yield();
+        __atomic_add_fetch(&ov_waits, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ov_wait_ns, ov_now() - t, __ATOMIC_RELAXED);
+    }
+    mprotect((void *)(uintptr_t)(fa & ~0xFFFull), 4096, PROT_READ | PROT_WRITE);
+    return true;
+}
+// open o's pages except those keep (sorted runs) still covers
+static void ov_open_except(const OvSet *o, const OvSet *keep) {
+    int k = 0;
+    for (int i = 0; i < o->n; i++) {
+        uint64_t a = o->lo[i], e = o->hi[i];
+        while (keep && k < keep->n && keep->hi[k] <= a) k++;
+        for (int j = k; keep && j < keep->n && keep->lo[j] < e && a < e; j++) {
+            if (keep->lo[j] > a) mprotect((void *)(uintptr_t)a, keep->lo[j] - a, PROT_READ | PROT_WRITE);
+            if (keep->hi[j] > a) a = keep->hi[j];
+        }
+        if (a < e) mprotect((void *)(uintptr_t)a, e - a, PROT_READ | PROT_WRITE);
+    }
+}
+void plat_ov_set_gpu_done(uint64_t (*fn)(void)) { ov_gpu_done = fn; }
+// the previous frame's GPU work is done: its pages open, except those the current frame protects
+void plat_ov_release_prev(void) {
+    OvSet *p = ov_prev;
+    if (!p) return;
+    ov_open_except(p, ov_cur);
+    __atomic_store_n(&ov_prev, NULL, __ATOMIC_RELEASE);
+}
+// seq 0: stats (the previous set is opened right away); else this frame's GPU work ends at seq and the previous set
+// stays until plat_ov_release_prev
+void plat_ov_protect(const uint64_t *lo, const uint64_t *hi, const uint8_t *w, int n, uint64_t seq) {
+    uint64_t t0 = ov_now();
+    OvSet *c = ov_cur, *p = ov_prev, *nw = NULL;
+    for (int i = 0; i < 3 && !nw; i++) if (&ov_sets[i] != c && &ov_sets[i] != p) nw = &ov_sets[i];
+    if (p) {  // (wait mode, a release missed) the oldest set goes now, keeping what the newer one covers
+        ov_open_except(p, c);
+        __atomic_store_n(&ov_prev, NULL, __ATOMIC_RELEASE);
+    }
+    if (n > OV_MAX) n = OV_MAX;
+    uint64_t pages = 0;
+    for (int i = 0; i < n; i++) { nw->lo[i] = lo[i]; nw->hi[i] = hi[i]; nw->w[i] = w[i]; pages += (hi[i] - lo[i]) >> 12; }
+    nw->n = n;
+    nw->seq = seq;
+    __atomic_store_n(&ov_prev, c, __ATOMIC_RELEASE);
+    __atomic_store_n(&ov_cur, nw, __ATOMIC_RELEASE);  // (published before its pages are protected: a fault finds its run)
+    for (int i = 0; i < n; i++) mprotect((void *)(uintptr_t)lo[i], hi[i] - lo[i], w[i] ? PROT_NONE : PROT_READ);
+    if (!seq) plat_ov_release_prev();
+    ov_prot_ns += ov_now() - t0;
+    ov_frames++; ov_pages_sum += (uint32_t)pages; ov_runs_sum += (uint32_t)n;
+}
+void plat_ov_frame_start(void) { ov_t0 = ov_now(); }
+void plat_ov_guest_write(uint64_t addr, uint64_t size) {
+    if (!size || (!ov_cur && !ov_prev)) return;
+    for (uint64_t p = addr & ~0xFFFull; p < addr + size; p += 4096)
+        if (ov_fault(p, true)) __atomic_add_fetch(&ov_sys, 1, __ATOMIC_RELAXED);  // (waits as an access would)
+}
+void plat_ov_set_worker(void) { ov_worker = gettid(); }
+void plat_ov_report(void) {
+    if (!ov_frames) return;
+    fprintf(stderr, "[overlap] %u frames: %.0f pages in %.0f runs a frame, protect %.2f ms a frame; syscall opens %u; waits %u (%.2f ms a frame)\n",
+            ov_frames, (double)ov_pages_sum / ov_frames, (double)ov_runs_sum / ov_frames, ov_prot_ns / 1e6 / ov_frames, ov_sys,
+            ov_waits, ov_wait_ns / 1e6 / ov_frames);
+    static const char *const kind[2] = {"GPU-read page", "GPU-written page"}, *acc[2] = {"read", "write"}, *who[2] = {"game", "worker"};
+    for (int k = 0; k < 2; k++)
+        for (int a = 0; a < 2; a++)
+            for (int t = 0; t < 2; t++) {
+                volatile uint32_t *c = ov_cnt[k][a][t];
+                if (c[0] | c[1] | c[2] | c[3])
+                    fprintf(stderr, "[overlap]   %-16s %-5s by %-6s: <4ms %u, 4-10 %u, 10-17 %u, >=17 %u\n", kind[k], acc[a], who[t], c[0], c[1], c[2], c[3]);
+            }
+    memset((void *)ov_cnt, 0, sizeof ov_cnt);
+    ov_sys = ov_frames = ov_pages_sum = ov_runs_sum = ov_waits = 0;
+    ov_prot_ns = ov_wait_ns = 0;
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
+#if defined(__x86_64__)
+    if (sig == SIGSEGV && ov_fault((uint64_t)(uintptr_t)si->si_addr, (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0)) return;  // [XCDE]
+#endif
     static volatile int depth;
     if (sig == SIGABRT && depth++ > 0) { signal(SIGABRT, SIG_DFL); abort(); }  // (nested: just die)
     uint64_t fa = (uint64_t)(uintptr_t)si->si_addr;

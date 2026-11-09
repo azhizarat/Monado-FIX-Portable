@@ -4653,8 +4653,77 @@ int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now
     return changed;
 }
 
+// ---- [XCDE] XCDE_OVERLAP_STATS=1 (Linux): what one frame in flight would collide with. Every guest-heap range the
+// GPU reads in place (vertex / index data, the storage buffers of gmem shaders) or writes (transform feedback, storing
+// shaders) is noted while a frame is recorded; at the game's frame boundary (objects.c, nvnSyncWait from the limiter)
+// those pages are protected (platform/linux.c plat_ov_*) and the CPU's touches of them during the next frame counted.
+static int ov_on = -1;
+static pthread_mutex_t ov_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint64_t lo, hi; uint8_t w; } *ov_r;
+static int ov_rn, ov_rcap;
+static void ov_note(uint64_t addr, uint64_t size, bool gpu_writes) {
+    extern bool vk_ov_wait_mode(void);
+    if (ov_on < 0) ov_on = getenv("XCDE_OVERLAP_STATS") ? atoi(getenv("XCDE_OVERLAP_STATS")) : vk_ov_wait_mode() ? 1 : 0;  // 1 all, 2 GPU reads, 3 GPU writes
+    if (!ov_on || !size || addr < HEAP_BASE || addr - HEAP_BASE >= HEAP_MAX || (ov_on == 2 && gpu_writes) || (ov_on == 3 && !gpu_writes)) return;
+    pthread_mutex_lock(&ov_lock);
+    if (ov_rn == ov_rcap) { ov_rcap = ov_rcap ? ov_rcap * 2 : 4096; ov_r = realloc(ov_r, ov_rcap * sizeof *ov_r); }
+    ov_r[ov_rn].lo = addr & ~0xFFFull; ov_r[ov_rn].hi = (addr + size + 0xFFF) & ~0xFFFull; ov_r[ov_rn].w = gpu_writes;
+    ov_rn++;
+    pthread_mutex_unlock(&ov_lock);
+}
+static void ov_note_sbufs(int stage, bool gpu_writes) {
+    for (int i = 0; i < 16; i++) ov_note(st.sbuf[stage][i].addr, st.sbuf[stage][i].size, gpu_writes);
+}
+static int ov_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+// (game thread, at the frame boundary: the worker has run every job of the frame) protect the frame's ranges.
+// seq: the frame's last submission (wait mode, XCDE_OVERLAP=1, one frame in flight: CPU accesses wait for it); 0: stats.
+// XCDE_OVERLAP: one frame in flight made safe by page protection (wait mode). On by default on Linux (Steam Deck: the
+// same field view 41 -> 55-57 fps; battle and pause menu clean, unlike the unprotected frame lag), XCDE_OVERLAP=0: off.
+bool vk_ov_wait_mode(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XCDE_OVERLAP");
+#ifdef __linux__
+        on = e ? atoi(e) != 0 : !getenv("XCDE_OVERLAP_STATS");
+#else
+        on = e && atoi(e) != 0;
+#endif
+    }
+    return on;
+}
+void vk_ov_frame(uint64_t seq) {
+    if (ov_on < 0) ov_note(0, 0, false);  // (reads the switches)
+    if (ov_on <= 0) return;
+    if (seq) {
+        // (the frame is already on the GPU's timeline: the worker submits after every fence in wait mode, CMD_FENCE_SYNC;
+        // an access must never wait for unsubmitted work)
+        plat_ov_set_gpu_done(vk_completed_seq);
+        if (seq > submit_seq) seq = submit_seq;
+    }
+    pthread_mutex_lock(&ov_lock);
+    qsort(ov_r, (size_t)ov_rn, sizeof *ov_r, ov_cmp);  // (by lo: the struct starts with it)
+    static uint64_t *lo, *hi; static uint8_t *w; static int cap;
+    if (cap < ov_rn) { cap = ov_rn; lo = realloc(lo, cap * 8); hi = realloc(hi, cap * 8); w = realloc(w, cap); }
+    int n = 0;
+    for (int i = 0; i < ov_rn; i++) {  // merge overlapping / touching ranges; a run with any GPU write is GPU-written
+        if (n && ov_r[i].lo <= hi[n - 1]) { if (ov_r[i].hi > hi[n - 1]) hi[n - 1] = ov_r[i].hi; w[n - 1] |= ov_r[i].w; }
+        else { lo[n] = ov_r[i].lo; hi[n] = ov_r[i].hi; w[n] = ov_r[i].w; n++; }
+    }
+    ov_rn = 0;
+    pthread_mutex_unlock(&ov_lock);
+    plat_ov_protect(lo, hi, w, n, seq);
+    static int frames;
+    static int every = -1;  // (stats: every 30 frames; wait mode: every 1800, a minute at 30 fps)
+    if (every < 0) every = getenv("XCDE_OVERLAP_STATS") ? 30 : 1800;
+    if (++frames % every == 0) plat_ov_report();
+}
+
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
+    ov_note(lo + HEAP_BASE, hi - lo, true);  // [XCDE] (XCDE_OVERLAP_STATS)
     if (!pt_init()) return;
     { static int nl; if (getenv("XCDE_TRACE_VC") && nl < 40 && !vc_page_gpu[lo / VC_PAGE]) { nl++; LOG("[vc] GPU writes %llx..%llx\n", (unsigned long long)(lo + HEAP_BASE), (unsigned long long)(hi + HEAP_BASE)); } }
     bool changed = false;
@@ -4958,6 +5027,7 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     }
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
+    ov_note(addr, size, false);  // [XCDE] (XCDE_OVERLAP_STATS) read in place by the GPU
     {   // (debugging) XCDE_TRACE_DIRECT=1: vertex / index ranges read in place from host memory, once per program and range
         static int tr = -1;
         if (tr < 0) tr = getenv("XCDE_TRACE_DIRECT") != NULL;
@@ -5356,6 +5426,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) { vc_mark_sbufs(5); if (nwant) xsh_stored(5); atomic_store(&host_read_pending, true); }
+    else if (cp->si->uses_gmem) ov_note_sbufs(5, false);  // [XCDE] (XCDE_OVERLAP_STATS)
     gmem_stage_finish(cp->si->uses_gmem_store);
     stat_dispatches++;
 }
@@ -6138,6 +6209,8 @@ static void draw_(CmdRec *r, bool indexed) {
     vk_bind_graphics_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, pr->gi ? 3 : 2, sets, 0, NULL);  // (always new sets)
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
     if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (pr->vi->uses_gmem && !pr->vi->uses_gmem_store) ov_note_sbufs(0, false);  // [XCDE] (XCDE_OVERLAP_STATS) gmem loads
+    if (pr->fi->uses_gmem && !pr->fi->uses_gmem_store) ov_note_sbufs(1, false);
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
@@ -7436,6 +7509,8 @@ static void exec_list(uint64_t handle, int depth) {
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
             if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
+            extern bool vk_ov_wait_mode(void);
+            if (r->x[1] && vk_ov_wait_mode()) renderer_submit();  // [XCDE] XCDE_OVERLAP: a waited-for fence is always submitted
             break;
         }
         case CMD_REPORT_COUNTER: {
@@ -7582,6 +7657,7 @@ void backend_pool_write(void *dst, const void *src, size_t n, int kind) {
 static void *rq_worker(void *arg) {
     (void)arg;
     tl_rq_worker = true;
+    plat_ov_set_worker();  // [XCDE] (XCDE_OVERLAP_STATS)
     for (;;) {
         pthread_mutex_lock(&rq_lock);
         while (rq_head == rq_tail) {

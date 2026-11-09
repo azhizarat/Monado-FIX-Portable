@@ -169,6 +169,11 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     static int whole = -1;  // LARECOMP_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
     if (backend_async()) { if (flush || whole) backend_drain(); else backend_wait_ticket(sync_of(A(0))->ticket); }
+    bool limiter = c->x[30] == 0x70005bd038ull;  // [XCDE] the game's frame limiter (see frame lag below)
+    extern bool vk_ov_wait_mode(void);
+    extern void vk_ov_frame(uint64_t seq);
+    // [XCDE] XCDE_OVERLAP(_STATS): protect the frame's GPU ranges (wait mode: until its submission is done)
+    if (limiter) vk_ov_frame(vk_ov_wait_mode() ? sync_of(A(0))->seq : 0);
     {   // [XCDE] perf (frame lag): the game's frame limiter (f_70005bcfe0 -> f_7000603900) waits at
         // the end of every frame for the GPU to finish that frame: CPU and GPU take turns. With the async worker the
         // frame's CPU-side data is captured once its jobs ran: wait for the GPU of the previous frame instead.
@@ -183,6 +188,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             int vc = vk_vcache_state();
             bool high = g_settings.fps == 0 || g_settings.fps > 60 || getenv("XCDE_FPS_PERIOD_SCALE");
             if (e) lag = atoi(e) != 0 && backend_async();
+            else if (vk_ov_wait_mode()) lag = backend_async();  // [XCDE] XCDE_OVERLAP=1: one frame in flight, made safe by the page protection
             else if (vc >= 0) lag = vc == 1 && backend_async() && high;
             if (lag >= 0) LOG("[nvn] frame lag %s\n", lag ? "on (one frame in flight)" : "off");
         }
@@ -190,6 +196,8 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             static uint64_t prev;
             uint64_t cur = sync_of(A(0))->seq;
             renderer_wait_seq(prev);
+            plat_ov_release_prev();  // [XCDE] (XCDE_OVERLAP) the previous frame's pages are free now
+            plat_ov_frame_start();
             prev = cur;
             RET(0);
             return;
@@ -198,6 +206,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    if (limiter) plat_ov_frame_start();  // [XCDE] (XCDE_OVERLAP_STATS) the CPU's next frame starts now
     RET(0);
 }
 NVN(nvnSyncCreateGLSync) { RET(0); }

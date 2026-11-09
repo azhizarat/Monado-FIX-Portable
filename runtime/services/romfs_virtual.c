@@ -360,6 +360,7 @@ static void copy_mem(uint8_t *dst, uint64_t off, uint64_t n, const uint8_t *src,
 
 // Reads `size` bytes at image offset `off` into dst; bytes outside any file or table read as zero. Returns bytes.
 int64_t rvfs_read(uint8_t *dst, uint64_t size, uint64_t off) {
+    plat_ov_guest_write((uint64_t)(uintptr_t)dst, size);  // [XCDE] (XCDE_OVERLAP_STATS: the kernel can't fault on it)
     if (off >= g_image_size) return 0;
     if (off + size > g_image_size) size = g_image_size - off;
     uint64_t done = 0;
