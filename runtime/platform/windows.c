@@ -109,6 +109,8 @@ void plat_ov_protect(const uint64_t *lo, const uint64_t *hi, const uint8_t *w, i
 void plat_ov_release_prev(void) {}
 void plat_ov_set_gpu_done(uint64_t (*fn)(void)) { (void)fn; }
 void plat_ov_set_gpu_wait(void (*fn)(uint64_t seq)) { (void)fn; }
+void plat_ov_set_heap(uint64_t base, uint64_t size) { (void)base, (void)size; }
+bool plat_ov_hot(uint64_t addr, uint64_t size) { (void)addr, (void)size; return false; }
 void plat_ov_frame_start(void) {}
 void plat_ov_guest_write(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 void plat_ov_set_worker(void) {}

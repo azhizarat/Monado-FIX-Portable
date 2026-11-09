@@ -113,7 +113,11 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         else if (mode == RES_MATCH && (g_settings.upscaler == UPSCALE_FSR3 || g_settings.upscaler == UPSCALE_DLSS)) {
             static const double ratio[] = {1.0, 1.5, 1.7, 2.0, 3.0};
             int q = g_settings.upscale_quality;
-            h /= ratio[q >= 0 && q <= 4 ? q : 1];
+            // [XCDE] XCDE_UPSCALE_RATIO=<output / render, 1.0-3.0>: a ratio between the quality modes (e.g. 1.25 on the Deck:
+            // 640p into 800p - "quality" renders only 533p there, and fine detail shimmers in motion)
+            static double forced = -1;
+            if (forced < 0) { const char *e = getenv("XCDE_UPSCALE_RATIO"); forced = e ? atof(e) : 0; if (forced && (forced < 1.0 || forced > 3.0)) forced = 0; }
+            h /= forced ? forced : ratio[q >= 0 && q <= 4 ? q : 1];
         }
     }
     h = fmax(h, 0.1);  // (.25x of a small window)

@@ -1,0 +1,317 @@
+diff --git a/ffx-api/src/backends.h b/ffx-api/src/backends.h
+index 4ac2a54..7c8c1b3 100644
+--- a/ffx-api/src/backends.h
++++ b/ffx-api/src/backends.h
+@@ -23,7 +23,7 @@
+ #pragma once
+ #include "ffx_provider.h"
+ #include <ffx_api/ffx_api.hpp>
+-#include <FidelityFx/host/ffx_interface.h>
++#include <FidelityFX/host/ffx_interface.h>
+ 
+ ffxReturnCode_t CreateBackend(const ffxCreateContextDescHeader* desc, bool& backendFound, FfxInterface* iface, size_t contexts, Allocator& alloc);
+ 
+diff --git a/ffx-api/src/ffx_provider.cpp b/ffx-api/src/ffx_provider.cpp
+index d7c0e64..222e893 100644
+--- a/ffx-api/src/ffx_provider.cpp
++++ b/ffx-api/src/ffx_provider.cpp
+@@ -30,7 +30,9 @@
+ #include <array>
+ #include <optional>
+ 
++#ifdef _WIN32
+ #include <d3d12.h>
++#endif
+ 
+ #ifdef FFX_BACKEND_DX12
+ #include "dx12/ffx_provider_framegenerationswapchain_dx12.h"
+@@ -55,6 +57,7 @@ static constexpr size_t providerCount = _countof(providers);
+ 
+ static std::array<std::optional<ffxProviderExternal>, 10> externalProviders = {};
+ 
++#ifdef _WIN32
+ MIDL_INTERFACE("b58d6601-7401-4234-8180-6febfc0e484c")
+ IAmdExtFfxApi : public IUnknown
+ {
+@@ -130,6 +133,10 @@ void GetExternalProviders(ID3D12Device* device, uint64_t descType)
+     }
+     
+ }
++#else  // [XCDE] Linux: no driver-side (amdxc64.dll) providers
++static void GetExternalProviders(void*, uint64_t) {}
++#define ID3D12Device void
++#endif
+ 
+ const ffxProvider* GetffxProvider(ffxStructType_t descType, uint64_t overrideId, void* device)
+ {
+diff --git a/ffx-api/src/ffx_provider.h b/ffx-api/src/ffx_provider.h
+index d501887..4e7d869 100644
+--- a/ffx-api/src/ffx_provider.h
++++ b/ffx-api/src/ffx_provider.h
+@@ -23,7 +23,7 @@
+ #pragma once
+ #include <ffx_api/ffx_api.hpp>
+ #include <ffx_api/ffx_api_types.h>
+-#include <FidelityFx/host/ffx_types.h>
++#include <FidelityFX/host/ffx_types.h>
+ 
+ #define VERIFY(_cond, _retcode) \
+     if (!(_cond)) return _retcode
+diff --git a/ffx-api/src/ffx_provider_framegeneration.cpp b/ffx-api/src/ffx_provider_framegeneration.cpp
+index 5b6e9d7..8b53112 100644
+--- a/ffx-api/src/ffx_provider_framegeneration.cpp
++++ b/ffx-api/src/ffx_provider_framegeneration.cpp
+@@ -77,7 +77,7 @@ struct InternalFgContext
+ uint64_t ffxProvider_FrameGeneration::GetId() const
+ {
+     // FG, version from header
+-    return 0xF600'0000ui64 << 32u | (FFX_SDK_MAKE_VERSION(FFX_FRAMEINTERPOLATION_VERSION_MAJOR, FFX_FRAMEINTERPOLATION_VERSION_MINOR, FFX_FRAMEINTERPOLATION_VERSION_PATCH) & 0xFFFF'FFFF);
++    return 0xF600'0000ull << 32u | (FFX_SDK_MAKE_VERSION(FFX_FRAMEINTERPOLATION_VERSION_MAJOR, FFX_FRAMEINTERPOLATION_VERSION_MINOR, FFX_FRAMEINTERPOLATION_VERSION_PATCH) & 0xFFFF'FFFF);
+ }
+ 
+ const char* ffxProvider_FrameGeneration::GetVersionName() const
+@@ -150,7 +150,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::CreateContext(ffxContext* context,
+             for (FfxUInt32 i = 0; i < 2; i++)
+             {
+                 FfxCreateResourceDescription dilD = fiResourceDescs.dilatedDepth;
+-                swprintf(Name, 255, L"%s%d", fiResourceDescs.dilatedDepth.name, i);
++                swprintf(Name, 255, L"%ls%d", fiResourceDescs.dilatedDepth.name, i);
+                 dilD.name = Name;
+                 TRY2(internal_context->backendInterfaceShared.fpCreateResource(
+                     &internal_context->backendInterfaceShared,
+@@ -159,7 +159,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::CreateContext(ffxContext* context,
+                     &internal_context->sharedResources[FFX_FSR3_RESOURCE_IDENTIFIER_DILATED_DEPTH_0 + (i * FFX_FSR3_RESOURCE_IDENTIFIER_UPSCALED_COUNT)]));
+ 
+                 FfxCreateResourceDescription dilMVs = fiResourceDescs.dilatedMotionVectors;
+-                swprintf(Name, 255, L"%s%d", fiResourceDescs.dilatedMotionVectors.name, i);
++                swprintf(Name, 255, L"%ls%d", fiResourceDescs.dilatedMotionVectors.name, i);
+                 dilMVs.name = Name;
+                 TRY2(internal_context->backendInterfaceShared.fpCreateResource(
+                     &internal_context->backendInterfaceShared,
+@@ -168,7 +168,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::CreateContext(ffxContext* context,
+                     &internal_context->sharedResources[FFX_FSR3_RESOURCE_IDENTIFIER_DILATED_MOTION_VECTORS_0 + (i * FFX_FSR3_RESOURCE_IDENTIFIER_UPSCALED_COUNT)]));
+ 
+                 FfxCreateResourceDescription recND = fiResourceDescs.reconstructedPrevNearestDepth;
+-                swprintf(Name, 255, L"%s%d", fiResourceDescs.reconstructedPrevNearestDepth.name, i);
++                swprintf(Name, 255, L"%ls%d", fiResourceDescs.reconstructedPrevNearestDepth.name, i);
+                 recND.name = Name;
+                 TRY2(internal_context->backendInterfaceShared.fpCreateResource(
+                     &internal_context->backendInterfaceShared,
+diff --git a/ffx-api/src/ffx_provider_fsr2.cpp b/ffx-api/src/ffx_provider_fsr2.cpp
+index 1c9e551..1637fe0 100644
+--- a/ffx-api/src/ffx_provider_fsr2.cpp
++++ b/ffx-api/src/ffx_provider_fsr2.cpp
+@@ -79,7 +79,7 @@ bool ffxProvider_FSR2::CanProvide(uint64_t type) const
+ uint64_t ffxProvider_FSR2::GetId() const
+ {
+     // FSR Scale, version from header
+-    return 0xF5A5'CA1Eui64 << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR2_VERSION_MAJOR, FFX_FSR2_VERSION_MINOR, FFX_FSR2_VERSION_PATCH) & 0xFFFF'FFFF);
++    return 0xF5A5'CA1Eull << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR2_VERSION_MAJOR, FFX_FSR2_VERSION_MINOR, FFX_FSR2_VERSION_PATCH) & 0xFFFF'FFFF);
+ }
+ 
+ const char* ffxProvider_FSR2::GetVersionName() const
+diff --git a/ffx-api/src/ffx_provider_fsr3upscale.cpp b/ffx-api/src/ffx_provider_fsr3upscale.cpp
+index c1e140c..d23338c 100644
+--- a/ffx-api/src/ffx_provider_fsr3upscale.cpp
++++ b/ffx-api/src/ffx_provider_fsr3upscale.cpp
+@@ -69,7 +69,7 @@ bool ffxProvider_FSR3Upscale::CanProvide(uint64_t type) const
+ uint64_t ffxProvider_FSR3Upscale::GetId() const
+ {
+     // FSR Scale, version from header
+-    return 0xF5A5'CA1Eui64 << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
++    return 0xF5A5'CA1Eull << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
+ }
+ 
+ const char* ffxProvider_FSR3Upscale::GetVersionName() const
+diff --git a/ffx-api/src/vk/ffx_provider_framegenerationswapchain_vk.cpp b/ffx-api/src/vk/ffx_provider_framegenerationswapchain_vk.cpp
+index 9239318..71e986a 100644
+--- a/ffx-api/src/vk/ffx_provider_framegenerationswapchain_vk.cpp
++++ b/ffx-api/src/vk/ffx_provider_framegenerationswapchain_vk.cpp
+@@ -92,7 +92,7 @@ bool ffxProvider_FrameGenerationSwapChain_VK::CanProvide(uint64_t type) const
+ uint64_t ffxProvider_FrameGenerationSwapChain_VK::GetId() const
+ {
+     // FG SwapChain VK, version 1.1.3
+-    return 0xF65D'564B'01'001'003ui64;
++    return 0xF65D'564B'01'001'003ull;
+ }
+ 
+ const char* ffxProvider_FrameGenerationSwapChain_VK::GetVersionName() const
+diff --git a/sdk/include/FidelityFX/host/ffx_types.h b/sdk/include/FidelityFX/host/ffx_types.h
+index ca9bc37..47f4ec1 100644
+--- a/sdk/include/FidelityFX/host/ffx_types.h
++++ b/sdk/include/FidelityFX/host/ffx_types.h
+@@ -77,7 +77,11 @@
+ #define FFX_API __declspec(dllexport)
+ #endif // #if defined (FFX_GCC)
+ 
++#ifdef _WIN32
+ #define FFX_SDK_DEFAULT_CONTEXT_SIZE (1024 * 128)
++#else  // [XCDE] the private contexts hold many wchar_t names: 4 bytes on Linux, they outgrow 128K dwords
++#define FFX_SDK_DEFAULT_CONTEXT_SIZE (1024 * 256)
++#endif
+ 
+ /// Maximum supported number of simultaneously bound SRVs.
+ ///
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+index 5c47b25..bae5eb7 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+@@ -660,7 +660,7 @@ FfxErrorCode ffxConfigureFrameInterpolationSwapchainVK(FfxSwapchain gameSwapChai
+         switch (key)
+         {
+             case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_WAITCALLBACK:
+-                pSwapChainVK->setWaitCallback(static_cast<FfxWaitCallbackFunc>(valuePtr));
++                pSwapChainVK->setWaitCallback(reinterpret_cast<FfxWaitCallbackFunc>(valuePtr));
+             break;
+             case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_FRAMEPACINGTUNING:
+                 if (valuePtr != nullptr)
+@@ -1184,7 +1184,8 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
+                     // if no frame was presented, we still need to update the semaphore
+                     if (toWait.count > 0)
+                     {
+-                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
++                        SubmissionSemaphores noSignal;
++                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, noSignal);
+                     }
+ 
+                     numFramesSentForPresentation = entry.numFramesSentForPresentationBase + entry.numFramesToPresent;
+@@ -1357,8 +1358,10 @@ struct SwapchainCreationInfo
+ 
+     VkImageCompressionControlEXT             imageCompressionControl;
+     VkImageFormatListCreateInfo              imageFormatList;
++#ifdef VK_USE_PLATFORM_WIN32_KHR
+     VkSurfaceFullScreenExclusiveInfoEXT      surfaceFullScreenExclusive;
+     VkSurfaceFullScreenExclusiveWin32InfoEXT surfaceFullScreenExclusiveWin32;
++#endif
+     VkSwapchainCounterCreateInfoEXT          swapchainCounter;
+     VkSwapchainDisplayNativeHdrCreateInfoAMD swapchainDisplayNativeHdr;
+     VkSwapchainPresentModesCreateInfoEXT     swapchainPresentModes;
+@@ -1392,6 +1395,7 @@ VkResult getRealSwapchainCreateInfo(const VkSwapchainCreateInfoKHR* pCreateInfo,
+         case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO:
+             FFX_USE_PNEXT_AS_IS(imageFormatList, VkImageFormatListCreateInfo);
+             break;
++#ifdef VK_USE_PLATFORM_WIN32_KHR  // [XCDE] (vulkan_win32.h)
+         case VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT:
+             realSwapchainCreateInfo.surfaceFullScreenExclusive       = *reinterpret_cast<const VkSurfaceFullScreenExclusiveInfoEXT*>(pCurrent);
+             realSwapchainCreateInfo.surfaceFullScreenExclusive.pNext = const_cast<void*>(realSwapchainCreateInfo.swapchain.pNext);  // because pNext is void* instead of const void* in vulkan header
+@@ -1400,6 +1404,7 @@ VkResult getRealSwapchainCreateInfo(const VkSwapchainCreateInfoKHR* pCreateInfo,
+         case VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT:
+             FFX_USE_PNEXT_AS_IS(surfaceFullScreenExclusiveWin32, VkSurfaceFullScreenExclusiveWin32InfoEXT);
+             break;
++#endif  // VK_USE_PLATFORM_WIN32_KHR
+         case VK_STRUCTURE_TYPE_SWAPCHAIN_COUNTER_CREATE_INFO_EXT:
+             FFX_USE_PNEXT_AS_IS(swapchainCounter, VkSwapchainCounterCreateInfoEXT);
+             break;
+@@ -2823,7 +2828,8 @@ VkResult FrameInterpolationSwapChainVK::submitCompositionOnGameQueue(const Pacin
+         // if no frame was presented, we still need to update the semaphore
+         if (toWait.count > 0)
+         {
+-            res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
++            SubmissionSemaphores noSignal;
++            res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, noSignal);
+         }
+     }
+ 
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
+index 0218ade..17fd5cf 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
+@@ -41,7 +41,9 @@
+ //   - On Windows, critical section and events are faster than their std counterparts
+ //   - using Win32 threads to set the priorities
+ //   - this needs to be ported to standard C++ or other platform if necessary
++#ifdef _WIN32
+ #include <Windows.h>
++#endif
+ 
+ #define FFX_FRAME_INTERPOLATION_SWAP_CHAIN_VERSION                     1
+ #define FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT            6
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h
+index 25f2c1e..cd994c7 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h
+@@ -27,8 +27,10 @@
+ #include <FidelityFX/host/ffx_assert.h>
+ #include <FidelityFX/host/backends/vk/ffx_vk.h>
+ 
++#ifdef _WIN32
+ #include <Windows.h>
+ #include <synchapi.h>
++#endif
+ 
+ 
+ void waitForPerformanceCount(const int64_t targetCount);
+diff --git a/sdk/src/backends/vk/ffx_vk.cpp b/sdk/src/backends/vk/ffx_vk.cpp
+index d914479..daf5729 100644
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -280,14 +280,14 @@ FFX_API size_t ffxGetScratchMemorySizeVK(VkPhysicalDevice physicalDevice, size_t
+         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &numExtensions, nullptr);
+ 
+     uint32_t extensionPropArraySize = sizeof(VkExtensionProperties) * numExtensions;
+-    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+-    uint32_t resourceViewArraySize = FFX_ALIGN_UP(((maxContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), sizeof(uint32_t));
+-    uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(maxContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+-    uint32_t pipelineArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+-    uint32_t resourceArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
+-    uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
++    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), 16);  // [XCDE] 16, not sizeof(uint32_t), here and in CreateBackendContextVK: clang uses aligned SSE stores on these arrays
++    uint32_t resourceViewArraySize = FFX_ALIGN_UP(((maxContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), 16);
++    uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(maxContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, 16);
++    uint32_t pipelineArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), 16);
++    uint32_t resourceArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), 16);
++    uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), 16);
+     
+-    return FFX_ALIGN_UP(sizeof(BackendContext_VK) + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
++    return FFX_ALIGN_UP(sizeof(BackendContext_VK) + 16 + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
+                             pipelineArraySize + resourceArraySize + contextArraySize,
+                         sizeof(uint64_t));
+ }
+@@ -403,11 +403,13 @@ uint32_t findMemoryTypeIndex(VkPhysicalDevice physicalDevice, VkMemoryRequiremen
+ 
+     uint32_t bestCandidate = UINT32_MAX;
+ 
++    // [XCDE] a second pass without the invisible-heap preference: UMA devices (lavapipe) have no device-local-only type
++    for (int pass = 0; pass < 2 && bestCandidate == UINT32_MAX; pass++)
+     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+         if ((memRequirements.memoryTypeBits & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & requestedProperties)) {
+ 
+             // if just device-local memory is requested, make sure this is the invisible heap to prevent over-subscribing the local heap
+-            if (requestedProperties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT && (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++            if (pass == 0 && requestedProperties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT && (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+                 continue;
+ 
+             bestCandidate = i;
+@@ -1402,13 +1404,13 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         new (&backendContext->uniformBufferMutex) std::mutex();
+ 
+         // Map all of our pointers
+-        uint32_t gpuJobDescArraySize   = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+-        uint32_t resourceViewArraySize = FFX_ALIGN_UP(((backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), sizeof(uint32_t));
+-        uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+-        uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+-        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
+-        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
+-        uint8_t* pMem = (uint8_t*)((BackendContext_VK*)(backendContext + 1));
++        uint32_t gpuJobDescArraySize   = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), 16);
++        uint32_t resourceViewArraySize = FFX_ALIGN_UP(((backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), 16);
++        uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, 16);
++        uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), 16);
++        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), 16);
++        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), 16);
++        uint8_t* pMem = (uint8_t*)FFX_ALIGN_UP((uintptr_t)(backendContext + 1), (uintptr_t)16);  // [XCDE] (+16 in the size)
+ 
+         // Map gpu job array
+         backendContext->pGpuJobs = (FfxGpuJobDescription*)pMem;
+diff --git a/sdk/src/shared/ffx_message.cpp b/sdk/src/shared/ffx_message.cpp
+index 7dd5127..92be3c1 100644
+--- a/sdk/src/shared/ffx_message.cpp
++++ b/sdk/src/shared/ffx_message.cpp
+@@ -21,6 +21,7 @@
+ // THE SOFTWARE.
+ 
+ #include <FidelityFX/host/ffx_message.h>
++#include <FidelityFX/host/ffx_util.h>  // [XCDE] (FFX_UNUSED, non-Windows path)
+ 
+ #ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN

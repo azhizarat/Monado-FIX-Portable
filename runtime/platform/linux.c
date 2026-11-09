@@ -216,6 +216,29 @@ static OvSet ov_sets[3];
 static OvSet *volatile ov_cur, *volatile ov_prev;
 static uint64_t (*volatile ov_gpu_done)(void);
 static void (*volatile ov_gpu_wait)(uint64_t);
+// [XCDE] "hot" pages: GPU-read pages the CPU wrote while the GPU still used them (a wait). exec.c then copies vertex /
+// index ranges on them at record time instead of reading them in place, so they leave the protected set.
+static uint64_t ov_hbase, ov_hpages;
+static uint8_t *ov_hot, *ov_hot_region;  // per page / per 2 MB region (any hot page in it)
+static volatile uint32_t ov_nhot;
+void plat_ov_set_heap(uint64_t base, uint64_t size) {
+    if (ov_hot || !size) return;
+    ov_hpages = size >> 12;
+    ov_hot = calloc(ov_hpages, 1);
+    ov_hot_region = calloc((ov_hpages >> 9) + 1, 1);
+    if (ov_hot && ov_hot_region) ov_hbase = base; else { free(ov_hot); free(ov_hot_region); ov_hot = ov_hot_region = NULL; }
+}
+bool plat_ov_hot(uint64_t a, uint64_t n) {
+    if (!ov_nhot || !ov_hbase || a < ov_hbase) return false;
+    uint64_t p = (a - ov_hbase) >> 12, e = (a + (n ? n : 1) - ov_hbase + 0xFFF) >> 12;
+    if (e > ov_hpages) e = ov_hpages;
+    while (p < e) {
+        if (!ov_hot_region[p >> 9]) { p = ((p >> 9) + 1) << 9; continue; }
+        if (ov_hot[p]) return true;
+        p++;
+    }
+    return false;
+}
 static volatile uint64_t ov_t0;  // CLOCK_MONOTONIC ns of the CPU's frame start
 static volatile pid_t ov_worker;
 // counters: [gpu-writes page? 1:0][cpu write? 1:0][worker? 1:0][time bucket: <4, 4-10, 10-17, >=17 ms]
@@ -251,6 +274,11 @@ static bool ov_fault(uint64_t fa, bool write) {
         while (done() < o->seq) sched_yield();  // (no wait function, or it gave up)
         __atomic_add_fetch(&ov_waits, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&ov_wait_ns, ov_now() - t, __ATOMIC_RELAXED);
+        if (write && !o->w[r] && ov_hot && fa >= ov_hbase && ((fa - ov_hbase) >> 12) < ov_hpages && !ov_hot[(fa - ov_hbase) >> 12]) {
+            uint64_t pg = (fa - ov_hbase) >> 12;
+            ov_hot[pg] = 1; ov_hot_region[pg >> 9] = 1;
+            __atomic_add_fetch(&ov_nhot, 1, __ATOMIC_RELAXED);
+        }
         static int nlog = -1;  // XCDE_OVERLAP_WHO=<n>: the first n waits - page, who, and the faulting code (RIP + stack words)
         if (nlog < 0) nlog = getenv("XCDE_OVERLAP_WHO") ? atoi(getenv("XCDE_OVERLAP_WHO")) : 0;
         if (nlog > 0 && ov_fault_uc) {
@@ -322,9 +350,9 @@ void plat_ov_guest_write(uint64_t addr, uint64_t size) {
 void plat_ov_set_worker(void) { ov_worker = gettid(); }
 void plat_ov_report(void) {
     if (!ov_frames) return;
-    fprintf(stderr, "[overlap] %u frames: %.0f pages in %.0f runs a frame, protect %.2f ms a frame; syscall opens %u; waits %u (%.2f ms a frame)\n",
+    fprintf(stderr, "[overlap] %u frames: %.0f pages in %.0f runs a frame, protect %.2f ms a frame; syscall opens %u; waits %u (%.2f ms a frame); hot pages %u\n",
             ov_frames, (double)ov_pages_sum / ov_frames, (double)ov_runs_sum / ov_frames, ov_prot_ns / 1e6 / ov_frames, ov_sys,
-            ov_waits, ov_wait_ns / 1e6 / ov_frames);
+            ov_waits, ov_wait_ns / 1e6 / ov_frames, ov_nhot);
     static const char *const kind[2] = {"GPU-read page", "GPU-written page"}, *acc[2] = {"read", "write"}, *who[2] = {"game", "worker"};
     for (int k = 0; k < 2; k++)
         for (int a = 0; a < 2; a++)

@@ -35,6 +35,9 @@ struct ffxCreateBackendVKDesc {
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 bool diag_deterministic(void);
@@ -63,7 +66,27 @@ static bool ffx_load(void) {
     LOG("[tmp] FidelityFX API loaded (FSR 3.1)\n");
     return true;
 #else
-    return false;
+    // [XCDE] Linux: libamd_fidelityfx_vk.so next to the executable (scripts/linux/ffx_build.sh: the SDK 1.1.4 sources
+    // built for Linux, same entry points as the DLL). dlopen doesn't search the executable's directory: absolute path.
+    char path[4096];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 32);
+    void *m = NULL;
+    if (n > 0) {
+        path[n] = 0;
+        char *sl = strrchr(path, '/');
+        if (sl) { strcpy(sl + 1, "libamd_fidelityfx_vk.so"); m = dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+    }
+    if (!m) m = dlopen("libamd_fidelityfx_vk.so", RTLD_NOW | RTLD_LOCAL);
+    if (!m) { LOG("[tmp] libamd_fidelityfx_vk.so not found next to the executable (%s): FSR 3 unavailable\n", dlerror()); return false; }
+    ffx_create = (PfnFfxCreateContext)dlsym(m, "ffxCreateContext");
+    ffx_destroy = (PfnFfxDestroyContext)dlsym(m, "ffxDestroyContext");
+    ffx_dispatch = (PfnFfxDispatch)dlsym(m, "ffxDispatch");
+    ffx_query = (PfnFfxQuery)dlsym(m, "ffxQuery");
+    ffx_configure = (PfnFfxConfigure)dlsym(m, "ffxConfigure");
+    if (!ffx_create || !ffx_destroy || !ffx_dispatch || !ffx_query || !ffx_configure) { LOG("[tmp] libamd_fidelityfx_vk.so: entry points missing\n"); return false; }
+    ffx_state = 1;
+    LOG("[tmp] FidelityFX API loaded (FSR 3.1, Linux build)\n");
+    return true;
 #endif
 }
 
@@ -515,6 +538,11 @@ float tmp_lod_bias(void) {
     if (forced == 1e9f) { const char *e = getenv("XCDE_TMP_LOD_BIAS"); forced = e && *e ? (float)atof(e) : 1e8f; }
     if (forced != 1e8f) return forced;
     if (!tmp_enabled()) return 0;
+    {   // [XCDE] XCDE_UPSCALE_RATIO (output_scale.c): the bias of that ratio, -log2(ratio)
+        const char *e = getenv("XCDE_UPSCALE_RATIO");
+        double r = e ? atof(e) : 0;
+        if (r >= 1.0 && r <= 3.0) return (float)-log2(r);
+    }
     switch (g_settings.upscale_quality) {
     case UQ_QUALITY: return -0.585f;   // 1.5x
     case UQ_BALANCED: return -0.766f;  // 1.7x

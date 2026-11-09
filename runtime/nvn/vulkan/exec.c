@@ -76,6 +76,7 @@ static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) neve
 static uint32_t prof_end_line[16384];  // passes ended, by the exec.c line that ended them (0: submit / present)
 static uint32_t prof_dirty_line[16384], rt_dirty_line;  // [XCDE] passes restarted by begin_pass, by the line that set rt_dirty
 #define RT_DIRTY() (st.rt_dirty = true, rt_dirty_line = __LINE__)
+static void skin_trace_note(const char *what, uint64_t v);  // (XCDE_SKIN_TRACE, defined before draw_)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
 uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
@@ -1826,6 +1827,7 @@ static uint64_t pass_seq_no;  // [XCDE] T220: counts begun passes
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pass_seq_no++;
+    skin_trace_note("P", 0);
     bool was_in_pass = in_pass, untracked = pass_untracked;
     if (prof && in_pass && rt_dirty_line < 16384) prof_dirty_line[rt_dirty_line]++;
     vk_end_pass();
@@ -4891,6 +4893,7 @@ void vk_ov_frame(uint64_t seq) {
         // an access must never wait for unsubmitted work)
         plat_ov_set_gpu_done(vk_completed_seq);
         plat_ov_set_gpu_wait(vk_block_seq);
+        plat_ov_set_heap(HEAP_BASE, HEAP_MAX);
         if (seq > submit_seq) seq = submit_seq;
     }
     pthread_mutex_lock(&ov_lock);
@@ -4898,9 +4901,48 @@ void vk_ov_frame(uint64_t seq) {
     static uint64_t *lo, *hi; static uint8_t *w; static int cap;
     if (cap < ov_rn) { cap = ov_rn; lo = realloc(lo, cap * 8); hi = realloc(hi, cap * 8); w = realloc(w, cap); }
     int n = 0;
-    for (int i = 0; i < ov_rn; i++) {  // merge overlapping / touching ranges; a run with any GPU write is GPU-written
-        if (n && ov_r[i].lo <= hi[n - 1]) { if (ov_r[i].hi > hi[n - 1]) hi[n - 1] = ov_r[i].hi; w[n - 1] |= ov_r[i].w; }
-        else { lo[n] = ov_r[i].lo; hi[n] = ov_r[i].hi; w[n] = ov_r[i].w; n++; }
+    static int coarse = -1;  // XCDE_OVERLAP_COARSE=1: a merged run with any GPU write is GPU-written as a whole (as before)
+    if (coarse < 0) coarse = getenv("XCDE_OVERLAP_COARSE") && atoi(getenv("XCDE_OVERLAP_COARSE")) != 0;
+    if (coarse) {
+        for (int i = 0; i < ov_rn; i++) {  // merge overlapping / touching ranges; a run with any GPU write is GPU-written
+            if (n && ov_r[i].lo <= hi[n - 1]) { if (ov_r[i].hi > hi[n - 1]) hi[n - 1] = ov_r[i].hi; w[n - 1] |= ov_r[i].w; }
+            else { lo[n] = ov_r[i].lo; hi[n] = ov_r[i].hi; w[n] = ov_r[i].w; n++; }
+        }
+    } else {
+        // [XCDE] perf: GPU-written pages exactly, the rest of the reads read-only. Merged as a whole, a large in-place
+        // vertex range that merely touched a storing shader's buffer became GPU-written (no access at all): the game's
+        // own reads of it faulted and waited for the GPU's whole frame (Colony 9: ~40 % of the waits, measured with
+        // XCDE_OVERLAP_WHO). Writes merge first; reads become the gaps between them.
+        static uint64_t *wl, *wh; static int wcap;
+        if (wcap < ov_rn) { wcap = ov_rn; wl = realloc(wl, wcap * 8); wh = realloc(wh, wcap * 8); }
+        int nw = 0;
+        for (int i = 0; i < ov_rn; i++) {
+            if (!ov_r[i].w) continue;
+            if (nw && ov_r[i].lo <= wh[nw - 1]) { if (ov_r[i].hi > wh[nw - 1]) wh[nw - 1] = ov_r[i].hi; }
+            else { wl[nw] = ov_r[i].lo; wh[nw] = ov_r[i].hi; nw++; }
+        }
+        if (cap < ov_rn + nw) { cap = ov_rn + nw; lo = realloc(lo, cap * 8); hi = realloc(hi, cap * 8); w = realloc(w, cap); }
+        int k = 0;  // (the next write run not yet passed)
+        for (int i = 0; i < ov_rn; i++) {
+            if (ov_r[i].w) continue;
+            uint64_t a = ov_r[i].lo, b = ov_r[i].hi;
+            while (a < b) {
+                while (k < nw && wh[k] <= a) k++;
+                uint64_t e = k < nw && wl[k] < b ? (wl[k] > a ? wl[k] : a) : b;  // (read part before the next write run)
+                if (e > a) {
+                    if (n && w[n - 1] == 0 && a <= hi[n - 1]) { if (e > hi[n - 1]) hi[n - 1] = e; }
+                    else { lo[n] = a; hi[n] = e; w[n] = 0; n++; }
+                }
+                a = k < nw && wl[k] < b ? wh[k] : b;  // (skip the write run)
+            }
+        }
+        // the write runs, then everything by address (reads never overlap writes now; touching runs stay separate)
+        for (int i = 0; i < nw; i++) { lo[n] = wl[i]; hi[n] = wh[i]; w[n] = 1; n++; }
+        for (int i = 1; i < n; i++) {  // (insertion sort: the read runs came out sorted, the writes go in between)
+            uint64_t l = lo[i], h = hi[i]; uint8_t ww = w[i]; int j = i - 1;
+            while (j >= 0 && lo[j] > l) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j]; w[j + 1] = w[j]; j--; }
+            lo[j + 1] = l; hi[j + 1] = h; w[j + 1] = ww;
+        }
     }
     ov_rn = 0;
     pthread_mutex_unlock(&ov_lock);
@@ -5210,6 +5252,11 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     g_direct_limit = ~0ull;
     if (nxsh) { XfbShadow *s = xsh_find(addr, size); if (s) { *buf = s->buf; *off = addr - s->base; g_direct_limit = s->base + s->size - addr; return true; } }  // (T175)
     if (vcache_lookup(addr, size, buf, off)) return true;
+    // [XCDE] perf: a range on "hot" pages (the game rewrote them while the GPU read them: platform/linux.c) is copied at
+    // record time instead, so the game's next write doesn't wait for the GPU's frame. XCDE_OVERLAP_HOT=0: always in place.
+    static int hot_on = -1;
+    if (hot_on < 0) { const char *e = getenv("XCDE_OVERLAP_HOT"); hot_on = !(e && atoi(e) == 0); }
+    if (hot_on && plat_ov_hot(addr, size)) return false;
     if (pt_state == 1 && nwant < 32 && vc_page_gpu[(addr - HEAP_BASE) / VC_PAGE] && xsh_store_on()) {  // (T197)
         bool k = false;
         for (int i = 0; i < nwant; i++) k |= xsh_want[i] == addr;
@@ -5867,6 +5914,80 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_ADD(prof_draw);
 }
 static uint64_t prof_tp_;
+// [XCDE] (skinning / overlap study) XCDE_SKIN_TRACE=<presented frame> (0: the frame after build/skin_now appears):
+// that frame's memory-writing draws ("W": storage buffers bound to the storing stages, transform feedback range), the
+// game's barriers ("B"), pass starts ("P") and every draw reading a range a writer wrote earlier in the frame ("R":
+// through which vertex stream / storage / uniform buffer, at which offset).
+static long skin_at = -2;
+static uint64_t skin_frame = ~0ull;
+static struct { uint64_t lo, hi; uint32_t id; } skin_w[1024];
+static int skin_nw;
+static uint32_t skin_nwr;
+static bool skin_on(void) {
+    if (skin_at == -2) { const char *e = getenv("XCDE_SKIN_TRACE"); skin_at = e ? atol(e) : -1; }
+    static uint64_t polled;
+    if (skin_at == 0 && renderer_present_count() >= polled + 30) {
+        polled = renderer_present_count();
+        if (!remove("build/skin_now")) skin_at = (long)renderer_present_count() + 1;
+    }
+    if (skin_at <= 0 || renderer_present_count() != (uint64_t)skin_at) return false;
+    if (skin_frame != renderer_present_count()) { skin_frame = renderer_present_count(); skin_nw = 0; skin_nwr = 0; LOG("[skin] ===== frame %ld\n", skin_at); }
+    return true;
+}
+static int skin_hit(uint64_t a, uint64_t n, uint64_t *off) {
+    for (int i = skin_nw - 1; i >= 0; i--)
+        if (a < skin_w[i].hi && a + (n ? n : 1) > skin_w[i].lo) { *off = a - skin_w[i].lo; return (int)skin_w[i].id; }
+    return -1;
+}
+static void skin_trace_draw(Prog *pr, CmdRec *r, uint64_t xfb_at, uint64_t xfb_bytes) {
+    if (!skin_on()) return;
+    ShaderInfo *sis[3] = {pr->vi, pr->fi, pr->gi};
+    bool stx[3] = {pr->vi->uses_gmem_store, pr->fi->uses_gmem_store, pr->gi && pr->gi->uses_gmem_store};
+    char line[2400];
+    int n = snprintf(line, sizeof line, "vs %016llx fs %016llx x1 %llu x2 %llu x3 %llu x4 %llu", (unsigned long long)st.program->stages[0].code_hash,
+                     (unsigned long long)st.program->stages[1].code_hash, (unsigned long long)r->x[1], (unsigned long long)r->x[2],
+                     (unsigned long long)r->x[3], (unsigned long long)r->x[4]);
+    if (stx[0] || stx[1] || stx[2] || xfb_bytes) {
+        uint32_t id = ++skin_nwr;
+        n += snprintf(line + n, sizeof line - n, " | stores:%s%s%s", stx[0] ? " vs" : "", stx[1] ? " fs" : "", stx[2] ? " gs" : "");
+        for (int sg = 0; sg < 3; sg++) {
+            if (!stx[sg]) continue;
+            for (int i = 0; i < 16; i++) {
+                Range b = st.sbuf[sg][i];
+                if (!b.addr || !b.size) continue;
+                n += snprintf(line + n, sizeof line - n, " s%d.%d %llx+%llx", sg, i, (unsigned long long)b.addr, (unsigned long long)b.size);
+                if (skin_nw < 1024) skin_w[skin_nw++] = (typeof(skin_w[0])){b.addr, b.addr + b.size, id};
+            }
+        }
+        if (xfb_bytes) {
+            n += snprintf(line + n, sizeof line - n, " xfb %llx+%llx", (unsigned long long)xfb_at, (unsigned long long)xfb_bytes);
+            if (skin_nw < 1024) skin_w[skin_nw++] = (typeof(skin_w[0])){xfb_at, xfb_at + xfb_bytes, id};
+        }
+        LOG("[skin] W%u %s\n", id, line);
+        return;
+    }
+    bool any = false;
+    uint64_t off;
+    int w;
+    for (int s = 0; s < 16; s++)
+        if (st.vbuf[s].addr && (w = skin_hit(st.vbuf[s].addr, st.vbuf[s].size, &off)) >= 0) {
+            any = true; n += snprintf(line + n, sizeof line - n, " vb%d %llx+%llx=W%d+%llx", s, (unsigned long long)st.vbuf[s].addr,
+                                      (unsigned long long)st.vbuf[s].size, w, (unsigned long long)off);
+        }
+    for (int sg = 0; sg < 3; sg++) {
+        if (!sis[sg]) continue;
+        for (int i = 0; i < 16 && sis[sg]->uses_gmem; i++)
+            if (st.sbuf[sg][i].addr && (w = skin_hit(st.sbuf[sg][i].addr, st.sbuf[sg][i].size, &off)) >= 0) {
+                any = true; n += snprintf(line + n, sizeof line - n, " s%d.%d=W%d+%llx", sg, i, w, (unsigned long long)off);
+            }
+        for (int i = 0; i < 18; i++)
+            if (st.ubuf[sg][i].addr && (w = skin_hit(st.ubuf[sg][i].addr, st.ubuf[sg][i].size, &off)) >= 0) {
+                any = true; n += snprintf(line + n, sizeof line - n, " cb%d.%d=W%d+%llx", sg, i, w, (unsigned long long)off);
+            }
+    }
+    if (any) LOG("[skin] R %s\n", line);
+}
+static void skin_trace_note(const char *what, uint64_t v) { if (skin_on()) LOG("[skin] %s %llx\n", what, (unsigned long long)v); }
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = prof_pp_ = SDL_GetTicksNS();
     prewarm_drain();  // [XCDE] T163
@@ -6634,6 +6755,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     stat_draws++, g_draws_total++;
     cum_draws++;
+    skin_trace_draw(pr, r, xfb_at, xfb_bytes);
     // [XCDE] T134: a draw whose shaders store to guest memory (XCDE's grass and skinning "writer" point draws) is read by
     // the next draws' vertex fetch; the game issues no barrier in between (Maxwell runs them in order), and Vulkan gives
     // no ordering inside a render pass. Without it the depth prepass drew grass from a half-written vertex buffer, the
@@ -7684,6 +7806,7 @@ static void exec_list(uint64_t handle, int depth) {
             // overlapped on the GPU: exploded hair and cloth, run-to-run differences (T124). The next draw starts a
             // new pass, which begins with a full barrier. (bits 0: the list-start marker of BeginRecording)
             if (g_debug_frame) LOG("[barrier] (pass %d) bits %#x in_pass %d\n", debug_pass_no, (unsigned)r->x[0], (int)in_pass);
+            skin_trace_note("B bits", r->x[0]);
             if ((uint32_t)r->x[0] && in_pass) { vk_end_pass(); RT_DIRTY(); pass_untracked = !(mem_track_mode() & 2); }  // (T162: tracked)
             break;
         case CMD_CLEAR_COLOR: {
