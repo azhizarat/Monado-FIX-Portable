@@ -82,6 +82,8 @@ static char g_log_path[1024];
 
 static void log_to_file_without_terminal(void) {
     if (isatty(STDERR_FILENO)) return;
+    struct stat se;  // [XCDE] already sent somewhere (play.sh: build/last_game.log, Steam: its pipe): keep it there
+    if (fstat(STDERR_FILENO, &se) == 0 && (S_ISREG(se.st_mode) || S_ISFIFO(se.st_mode) || S_ISSOCK(se.st_mode))) return;
     char dir[900];
     const char *env = getenv("LARECOMP_DATA_ROOT"), *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
     struct stat st;
@@ -100,13 +102,13 @@ static void log_to_file_without_terminal(void) {
 }
 
 #if defined(__x86_64__)
-// The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
-// with an illegal instruction on an older CPU.
+#include <cpuid.h>
+// [XCDE] Monado builds for x86-64-v2 (scripts/build_*.sh: -march=x86_64_v2), like the Windows check: SSE4.2 + POPCNT.
+// (cpuid directly: zig's compiler-rt answers __builtin_cpu_supports with zeros, which stopped a Zen 2 Steam Deck.)
 static void require_cpu(void) {
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    fprintf(stderr, "FATAL: LAS Recomp needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
-                    "newer).\n");
+    unsigned a, b, c, d;
+    if (__get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSE4_2) && (c & bit_POPCNT)) return;
+    fprintf(stderr, "FATAL: Monado needs a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer / 2011 or newer).\n");
     exit(1);
 }
 #else
@@ -283,3 +285,20 @@ unsigned long long plat_guest_dump(const char *path) { (void)path; return 0; }  
 
 // [VEGA-FIX] no crash guard on this platform: just run it
 bool plat_try_call(void (*fn)(void *), void *arg) { fn(arg); return true; }
+
+// ---- memory report (exec.c, XCDE_MEM_MAP): private = RssAnon, working set = VmRSS from /proc/self/status.
+// ponytail: guest_commit is not measured (0); walk /proc/self/smaps over the guest window if it is ever needed here.
+void plat_mem_info(uint64_t *priv, uint64_t *ws, uint64_t *guest_commit) {
+    *priv = *ws = *guest_commit = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    unsigned long long kb;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "VmRSS: %llu kB", &kb) == 1) *ws = kb << 10;
+        else if (sscanf(line, "RssAnon: %llu kB", &kb) == 1) *priv = kb << 10;
+    }
+    fclose(f);
+}
+
+void plat_mem_map(void) { fprintf(stderr, "[memmap] not implemented on Linux (see /proc/<pid>/smaps)\n"); }

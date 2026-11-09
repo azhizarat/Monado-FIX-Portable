@@ -1,3 +1,4 @@
+#ifdef _WIN32  // (Streamline is Windows-only: the Linux build gets the "unavailable" stubs at the end)
 #define VK_USE_PLATFORM_WIN32_KHR
 // [XCDE] NVIDIA DLSS Super Resolution through Streamline 2.x (third_party/streamline, MIT; sl.interposer.dll,
 // sl.common.dll, sl.dlss.dll and nvngx_dlss.dll next to the exe), for temporal.c. Streamline's manual hooking mode:
@@ -380,3 +381,26 @@ extern "C" bool dlss_evaluate(VkCommandBuffer cb, const TexBackend *color, const
     if (r != sl::Result::eOk) { snprintf(dlss_note, sizeof dlss_note, "DLSS dispatch falló (SDK %d); frame con escalado alternativo", (int)r); static int n; if (n++ < 5) DLOG("[dlss] %s\n", dlss_note); return false; }
     return true;
 }
+
+#else  // Linux: no Streamline. temporal.c / device.c see DLSS as unavailable and use FSR.
+#include <stdbool.h>
+#include <stdint.h>
+#include <vulkan/vulkan.h>
+extern "C" {
+#include "temporal.h"
+}
+extern "C" const char *dlss_status(void) { return "DLSS: Windows only"; }
+extern "C" bool dlss_init_early(void) { return false; }
+extern "C" int dlss_instance_exts(const char **out, int max) { (void)out, (void)max; return 0; }
+extern "C" void dlss_validate_adapter(VkPhysicalDevice, uint32_t, uint32_t) {}
+extern "C" void dlss_device_requirements(const char **, uint32_t *, uint32_t, VkPhysicalDeviceVulkan12Features *,
+                                         VkPhysicalDeviceVulkan13Features *, uint32_t *extra_gfx, uint32_t *extra_compute) {
+    *extra_gfx = *extra_compute = 0;
+}
+extern "C" void dlss_device_created(VkInstance, VkPhysicalDevice, VkDevice, uint32_t) {}
+extern "C" bool dlss_create_surface(void *, VkInstance, VkPhysicalDevice, uint32_t, VkSurfaceKHR *) { return false; }
+extern "C" PFN_vkVoidFunction dlss_proxy(VkDevice, const char *) { return nullptr; }
+extern "C" bool dlss_available(void) { return false; }
+extern "C" bool dlss_evaluate(VkCommandBuffer, const TexBackend *, const TexBackend *, const TexBackend *, const TexBackend *,
+                              const TexBackend *, const float[2], bool, const TmpCamera *, const double[16]) { return false; }
+#endif

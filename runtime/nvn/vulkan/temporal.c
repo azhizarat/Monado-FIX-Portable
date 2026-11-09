@@ -19,6 +19,9 @@
 #include "../../diag/diag.h"
 #include "../../settings.h"
 #include "temporal.h"
+#ifndef _WIN32
+#define __declspec(x)  // (ffx_api.h marks its entry points dllexport; here they are only loaded at run time)
+#endif
 #include "ffx_api/ffx_api.h"
 #include "ffx_api/ffx_upscale.h"
 // (ffx_api/vk/ffx_api_vk.h is C++-only: its one structure used here, as declared there)

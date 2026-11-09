@@ -234,6 +234,9 @@ static void scan_buf(const uint8_t *d, size_t n) {
         if (!memcmp(d + i, "HCPS", 4)) scan_spch(d, n, i);
 }
 
+#ifndef _WIN32
+#define _ftelli64 ftello  // (off_t is 64-bit on x86-64 Linux)
+#endif
 static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;  // (one file over 64 MB at a time: memory on 8 GB PCs)
 static void scan_file(const char *path) {
     FILE *f = fopen(path, "rb");

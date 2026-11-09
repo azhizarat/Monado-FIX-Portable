@@ -14,7 +14,47 @@
 // address across a switch that moves the code to another thread.
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+// Linux: the few Win32 fiber calls this file uses, over ucontext (each fiber: its own mmap'd stack).
+// ponytail: swapcontext also saves/restores the signal mask (one syscall per switch); a hand-written
+// register switch is the upgrade if fiber switches ever show up in a profile.
+#include <pthread.h>
+#include <sys/mman.h>
+#include <ucontext.h>
+#define CALLBACK
+typedef struct { ucontext_t uc; void *stack; size_t size; void (*fn)(void *); void *arg; } PosixFiber;
+static __thread PosixFiber *t_host;  // host fiber running on this thread (read through the accessors: see below)
+__attribute__((noinline)) static PosixFiber *host_get(void) { __asm__ volatile("" ::: "memory"); return t_host; }
+__attribute__((noinline)) static void host_set(PosixFiber *f) { t_host = f; __asm__ volatile("" ::: "memory"); }
+static int IsThreadAFiber(void) { return host_get() != NULL; }
+static void *GetCurrentFiber(void) { return host_get(); }
+static void *ConvertThreadToFiber(void *p) { (void)p; PosixFiber *f = calloc(1, sizeof *f); host_set(f); return f; }
+static void fiber_entry(void) { PosixFiber *f = host_get(); f->fn(f->arg); abort(); }  // (fiber_main never returns)
+static void *CreateFiberEx(size_t commit, size_t reserve, int flags, void (*fn)(void *), void *arg) {
+    (void)commit; (void)flags;
+    PosixFiber *f = calloc(1, sizeof *f);
+    f->stack = mmap(NULL, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
+    if (f->stack == MAP_FAILED) { free(f); return NULL; }
+    f->size = reserve, f->fn = fn, f->arg = arg;
+    getcontext(&f->uc);
+    f->uc.uc_stack.ss_sp = f->stack;
+    f->uc.uc_stack.ss_size = reserve;
+    f->uc.uc_link = NULL;
+    makecontext(&f->uc, fiber_entry, 0);
+    return f;
+}
+static void SwitchToFiber(void *to) {
+    PosixFiber *from = host_get();
+    host_set(to);
+    swapcontext(&from->uc, &((PosixFiber *)to)->uc);
+}
+static void DeleteFiber(void *p) { PosixFiber *f = p; if (f->stack) munmap(f->stack, f->size); free(f); }
+static unsigned long GetLastError(void) { return 0; }
+typedef size_t SIZE_T;
+typedef pthread_mutex_t CRITICAL_SECTION;
+#endif
 
 #include "../rt.h"
 
@@ -30,12 +70,18 @@ typedef struct HFiber {
 
 #define NBUCKETS 4096
 static HFiber *g_buckets[NBUCKETS];
+#ifdef _WIN32
 static CRITICAL_SECTION g_lock;
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK init_lock(PINIT_ONCE o, PVOID p, PVOID *ctx) { (void)o; (void)p; (void)ctx; InitializeCriticalSection(&g_lock); return TRUE; }
 static void lock(void) { InitOnceExecuteOnce(&g_once, init_lock, NULL, NULL); EnterCriticalSection(&g_lock); }
 static void unlock(void) { LeaveCriticalSection(&g_lock); }
+#else
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void) { pthread_mutex_lock(&g_lock); }
+static void unlock(void) { pthread_mutex_unlock(&g_lock); }
+#endif
 
 static unsigned bucket(uint64_t key) { return (unsigned)((key >> 4) * 0x9E3779B1u) % NBUCKETS; }
 static HFiber *find(uint64_t key) {

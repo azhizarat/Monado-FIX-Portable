@@ -4,18 +4,22 @@
 // block on, so it also works when the hang is inside the kernel lock.
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <time.h>
-#include <windows.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #include "../kernel.h"
 #include "../rt.h"
 #include "diag.h"
 
-static DWORD WINAPI stall_main(LPVOID p) {
+static void *stall_main(void *p) {
     unsigned secs = (unsigned)(uintptr_t)p, still = 0, reports = 0;
     uint64_t last = 0;
     for (;;) {
-        Sleep(1000);
+        plat_sleep_until_ns(plat_now_ns() + 1000000000ull);
         uint64_t n = diag_frame();
         if (n != last || n == 0) { last = n; still = 0; continue; }  // (loading before the first frame is not a stall)
         if (++still < secs || (still - secs) % secs) continue;
@@ -23,7 +27,11 @@ static DWORD WINAPI stall_main(LPVOID p) {
         kernel_dump_threads(stderr);
         extern void backend_stall_report(FILE *f);  // [XCDE] T240: the render worker too
         backend_stall_report(stderr);
-        CreateDirectoryA("crash", NULL);
+#ifdef _WIN32
+        _mkdir("crash");
+#else
+        mkdir("crash", 0755);
+#endif
         char path[64];
         snprintf(path, sizeof path, "crash/stall_%u.txt", reports);
         FILE *f = fopen(path, "w");
@@ -40,5 +48,6 @@ static DWORD WINAPI stall_main(LPVOID p) {
 void diag_watchdog_start(void) {
     const char *e = getenv("XCDE_STALL");
     unsigned secs = e ? (unsigned)atoi(e) : 5;
-    if (secs) CreateThread(NULL, 0, stall_main, (LPVOID)(uintptr_t)secs, 0, NULL);
+    pthread_t t;
+    if (secs) pthread_create(&t, NULL, stall_main, (void *)(uintptr_t)secs);
 }
