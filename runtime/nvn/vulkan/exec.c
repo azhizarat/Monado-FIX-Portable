@@ -4110,7 +4110,11 @@ static void resolve_feedback(Prog *pr) {
             // T252 made snapshots the default on every vendor. [PERF-V5] the direct path (V4 behaviour, +16 % in battle) is the
             // default again on ALL vendors. LARECOMP_FEEDBACK_DIRECT=0 brings the snapshots back (if blue textures / flicker appear).
             if (direct < 0) { const char *e = getenv("LARECOMP_FEEDBACK_DIRECT"); direct = !e || atoi(e) != 0; }
-            if (direct && t != st.rt.depth) continue;
+            if (direct && t != st.rt.depth) {
+                // [XCDE] the attachment is read in the draw that writes it: no colour compression (textures.c want_no_dcc)
+                if (t->backend && ((TexBackend *)t->backend)->nlean) { vk_end_pass(); st.rt_dirty = true; vk_tex_drop_dcc(t, vk_cmd()); }
+                continue;
+            }
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;

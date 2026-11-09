@@ -130,6 +130,7 @@ typedef struct TexBackend {
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 bool vk_tex_add_storage(NvnTexture *t, VkCommandBuffer cb);  // [XCDE] T192 (textures.c)
+bool vk_tex_drop_dcc(NvnTexture *t, VkCommandBuffer cb);  // [XCDE] feedback-loop textures without DCC (textures.c)
 VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 // View of t (optionally through an NVN texture view) for rendering or sampling.

@@ -247,6 +247,20 @@ static bool storage_wanted(const NvnTexture *t) {
     return false;
 }
 
+// [XCDE] Textures read and written in the same draw (exec.c resolve_feedback, the direct path: the game's in-shader
+// blending reads the attachment it renders to) must not be colour-compressed: with AMD's DCC (on through the lean
+// format list below) the shader reads compressed blocks that the same pass is changing - white / red / blue specks on
+// RADV (Steam Deck), measured gone with RADV_DEBUG=nodcc. Those textures are re-created without the format list (a
+// mutable image without one gets no DCC) and remembered, so a later image for the same texture is made that way.
+static struct { uint64_t addr; uint32_t format, w, h; } want_no_dcc[256];
+static int nwant_no_dcc;
+static bool no_dcc_wanted(const NvnTexture *t) {
+    for (int i = 0; i < nwant_no_dcc; i++)
+        if (want_no_dcc[i].addr == t->addr && want_no_dcc[i].format == t->format && want_no_dcc[i].w == t->width && want_no_dcc[i].h == t->height)
+            return true;
+    return false;
+}
+
 static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &p);
@@ -451,7 +465,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         lean = e ? atoi(e) != 0 : g_vk.props.vendorID != 0x10DE;
         LOG("[vk] lean image formats: %s\n", lean ? "on" : "off");
     }
-    if (lean && !depthfmt) {
+    if (lean && !depthfmt && !no_dcc_wanted(t)) {
         b->lean_fmt[b->nlean++] = vf;
         VkFormat tw = srgb_twin(vf);
         if (tw != VK_FORMAT_UNDEFINED) b->lean_fmt[b->nlean++] = tw;
@@ -1474,6 +1488,48 @@ bool vk_tex_add_storage(NvnTexture *t, VkCommandBuffer cb) {
     defer((Dead){.img = old.image, .mem = old.mem});
     static int nl;
     if (nl++ < 20) LOG("[vk] T192: %llx %ux%u fmt %d re-created with storage usage (SULD / SUST)\n", (unsigned long long)t->addr, b->width, b->height, (int)b->format);
+    return true;
+}
+
+// [XCDE] see want_no_dcc: true if the image was re-created (the caller ended the render pass; cb: where to copy)
+bool vk_tex_drop_dcc(NvnTexture *t, VkCommandBuffer cb) {
+    TexBackend *b = t->backend;
+    if (!b || !b->image || !b->nlean || b->samples > 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    if (!no_dcc_wanted(t) && nwant_no_dcc < 256)
+        want_no_dcc[nwant_no_dcc++] = (typeof(want_no_dcc[0])){t->addr, t->format, t->width, t->height};
+    TexBackend old = *b;
+    views_forget(b);
+    tex_bytes_add(b, -1);
+    b->image = VK_NULL_HANDLE; b->mem = VK_NULL_HANDLE;
+    create_image(t, b);
+    if (b->format != old.format || b->width != old.width || b->height != old.height || b->levels != old.levels ||
+        b->layers != old.layers || b->depth != old.depth) {  // (should not happen: keep the old image, it only has DCC)
+        LOG("[vk] no-DCC re-creation of %llx did not match (fmt %d -> %d)\n", (unsigned long long)t->addr, (int)old.format, (int)b->format);
+        tex_bytes_add(b, -1);
+        if (b->image) defer((Dead){.img = b->image, .mem = b->mem});
+        *b = old;
+        tex_bytes_add(b, 1);
+        b->nlean = 0;  // (don't try again)
+        return false;
+    }
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkImageCopy rg[16];
+    uint32_t n = 0;
+    for (uint32_t lv = 0; lv < b->levels && n < 16; lv++) {
+        uint32_t d = b->depth >> lv;
+        rg[n++] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, b->layers}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, b->layers},
+                                .extent = {level_w(b, lv), level_h(b, lv), d ? d : 1}};
+    }
+    vkCmdCopyImage(cb, old.image, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+    vkCmdPipelineBarrier2(cb, &di);
+    defer((Dead){.img = old.image, .mem = old.mem});
+    static int nl;
+    if (nl++ < 40) LOG("[vk] %llx %ux%u fmt %d re-created without colour compression (read while rendered to)\n",
+                       (unsigned long long)t->addr, b->width, b->height, (int)b->format);
     return true;
 }
 
