@@ -2207,7 +2207,22 @@ static HTab prog_tab = {.name = "program"};
 // [XCDE] Texture units of `stage` whose bound texture is a depth-stencil image read in STENCIL mode (NVN depth-stencil mode
 // of the view if it sets one, else of the texture): the shader samples those as unsigned integers (ShaderKey.tex_uint).
 // NVN: 0 depth, 1 stencil (seen in the game: the stencil-reading shader samples a mode-1 D24S8).
+// [XCDE] perf: generation of everything stencil_unit_mask reads besides the bindings - texture pool entries
+// (pool_write_apply) and texture objects (nvnTextureInitialize, objects.c). Its result is remembered per stage
+// for the same pool, bindings and generation (it walked 32 units x 2 stages a draw: ~4 % of the render thread).
+static _Atomic uint32_t g_tex_desc_gen;
+void vk_tex_desc_changed(void) { atomic_fetch_add_explicit(&g_tex_desc_gen, 1, memory_order_relaxed); }
+static uint32_t stencil_unit_mask_(int stage);
 static uint32_t stencil_unit_mask(int stage) {
+    static struct { uint32_t gen, mask; const void *tpool; uint64_t tex[32]; bool valid; } memo[6];
+    uint32_t g = atomic_load_explicit(&g_tex_desc_gen, memory_order_relaxed);
+    typeof(memo[0]) *m = &memo[stage];
+    if (m->valid && m->gen == g && m->tpool == st.tpool && !memcmp(m->tex, st.tex[stage], sizeof m->tex)) return m->mask;
+    m->mask = stencil_unit_mask_(stage);
+    m->gen = g; m->tpool = st.tpool; memcpy(m->tex, st.tex[stage], sizeof m->tex); m->valid = true;
+    return m->mask;
+}
+static uint32_t stencil_unit_mask_(int stage) {
     if (!st.tpool) return 0;
     uint32_t mask = 0;
     for (int u = 0; u < 32; u++) {
@@ -7620,6 +7635,7 @@ typedef struct { uint64_t tag; void *dst; uint32_t n, kind; uint64_t data[16]; }
 static PoolWrite *pwq;
 static size_t pwq_n, pwq_cap, pwq_done;  // (queued / applied; reset when all are applied)
 static void pool_write_apply(const PoolWrite *w) {
+    if (w->kind == 1) vk_tex_desc_changed();  // [XCDE] (stencil_unit_mask memo)
     if (w->kind == 1) {  // a texture pool entry: the glitch watch's slot history
         NvnTexEntry *e = w->dst;
         NvnTexEntry v;
@@ -7639,7 +7655,7 @@ void backend_pool_write(void *dst, const void *src, size_t n, int kind) {
     static int imm = -1;
     if (imm < 0) imm = getenv("XCDE_POOL_IMMEDIATE") != NULL;
     PoolWrite w = {.dst = dst, .n = (uint32_t)n, .kind = (uint32_t)kind};
-    if (n > sizeof w.data) { memcpy(dst, src, n); return; }
+    if (n > sizeof w.data) { memcpy(dst, src, n); if (kind == 1) vk_tex_desc_changed(); return; }
     memcpy(w.data, src, n);
     if (imm || !backend_async()) { pool_write_apply(&w); return; }
     pthread_mutex_lock(&rq_lock);

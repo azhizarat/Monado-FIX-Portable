@@ -407,6 +407,7 @@ static NvnTexture *texture_from_builder(uint64_t b) {
     t->samples = G(uint32_t, b, 0x24);
     memcpy(t->swizzle, (void *)(uintptr_t)(b + 0x28), 4);
     t->ds_mode = G(uint32_t, b, 0x2C);
+    { extern void vk_tex_desc_changed(void); vk_tex_desc_changed(); }  // [XCDE] (exec.c stencil_unit_mask memo)
     t->stride = G(uint64_t, b, 0x30);
     uint64_t pool = G(uint64_t, b, 0x38);
     t->pool = pool ? HOST(NvnPool, pool) : NULL;
