@@ -52,6 +52,121 @@ static void sp(Str *s, const char *fmt, ...) {
     s->len += n;
 }
 
+// [XCDE] Structured control flow for branchy programs (GLSL). The translation emits a branchy program's body as
+// blocks ("  case <pc>u:") whose jumps are "pc = <pc>u; continue;" (stack targets already resolved at translation)
+// and whose EXIT is "exit_now = true; break;", run by a `for (guard) switch (pc)` state machine. That state machine
+// costs the AMD compiler a lot: measured on a Steam Deck (tools/shaderlab), a 2-block fragment shader went from 641
+// instructions / 64 VGPRs to 546 / 40 written as plain ifs. Here the same blocks are emitted in program order, each
+// guarded by its own flag:   if (b_<pc>) { b_<pc> = false; do { <body: a jump sets the target's flag and breaks,
+// EXIT just breaks> b_<next> = true; } while (false); }   - forward jumps need nothing else. A backward jump (to
+// block h from block j >= h) makes [h, j] a loop: those blocks go inside
+//   for (uint g_<h> = 0u; g_<h> < 100000u; g_<h>++) { ...; if (!b_<h>) break; }
+// (the back edge set b_<h> again; the guard keeps the old 100000-step bound). Loops must nest and be entered through
+// their first block; anything else (dynamic stack targets, BRX, overlapping loops, a jump into a loop's middle, an
+// unexpected break / continue in the body) returns NULL and the program keeps the state machine.
+// XCDE_STRUCT=0: off (always the state machine).
+typedef struct { uint32_t pc; const char *lo, *hi; int loop_end; } SBlock;
+static const char *mem_find(const char *h, size_t n, const char *needle) {  // (memmem: not in MinGW)
+    size_t m = strlen(needle);
+    for (size_t i = 0; i + m <= n; i++) if (!memcmp(h + i, needle, m)) return h + i;
+    return NULL;
+}
+static void struct_emit(Str *o, SBlock *b, int nb, int a, int z, int skip_loop_at) {
+    for (int k = a; k <= z;) {
+        if (b[k].loop_end >= 0 && k != skip_loop_at) {
+            int e = b[k].loop_end;
+            sp(o, "  for (uint g_%u = 0u; g_%u < 100000u; g_%u++) {\n", b[k].pc, b[k].pc, b[k].pc);
+            struct_emit(o, b, nb, k, e, k);
+            sp(o, "  if (!b_%u) break;\n  }\n", b[k].pc);
+            k = e + 1;
+            continue;
+        }
+        sp(o, "  if (b_%u) { b_%u = false; do {\n", b[k].pc, b[k].pc);
+        for (const char *l = b[k].lo; l < b[k].hi;) {  // the block's lines, jumps / EXIT rewritten
+            const char *nl = memchr(l, '\n', (size_t)(b[k].hi - l));
+            size_t n = nl ? (size_t)(nl - l) + 1 : (size_t)(b[k].hi - l);
+            const char *j = mem_find(l, n, "pc = ");
+            const char *x = mem_find(l, n, "exit_now = true; break;");
+            if (j) {  // "pc = <t>u; continue;" -> "b_<t> = true; break;" (the rest of the line kept)
+                char *end;
+                uint32_t t = (uint32_t)strtoul(j + 5, &end, 10);
+                end += 12;  // ("u; continue;", checked by structurize)
+                sp(o, "%.*sb_%u = true; break;%.*s", (int)(j - l), l, t, (int)(l + n - end), end);
+            } else if (x) {  // EXIT: just leave the block (no flag set: nothing runs after it)
+                const char *end = x + 23;
+                sp(o, "%.*sbreak;%.*s", (int)(x - l), l, (int)(l + n - end), end);
+            } else {
+                sp(o, "%.*s", (int)n, l);
+            }
+            l += n;
+        }
+        if (k + 1 < nb) sp(o, "    b_%u = true;\n", b[k + 1].pc);
+        sp(o, "  } while (false); }\n");
+        k++;
+    }
+}
+static char *structurize(const char *body) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XCDE_STRUCT"); on = !e || atoi(e) != 0; }
+    if (!on || !body || strncmp(body, "  case ", 7)) return NULL;
+    // anything the rewrite doesn't know: keep the state machine
+    if (strstr(body, "ssy[") || strstr(body, "pbk[") || strstr(body, "pcnt[") || strstr(body, "pc = t") || strstr(body, "pc = (")) return NULL;
+    int cap = 64, nb = 0;
+    SBlock *b = malloc(cap * sizeof *b);
+    for (const char *p = body; *p;) {  // split at "  case <pc>u:"
+        const char *nl = strchr(p, '\n');
+        const char *next = nl ? nl + 1 : p + strlen(p);
+        if (!strncmp(p, "  case ", 7)) {
+            if (nb == cap) { cap *= 2; b = realloc(b, cap * sizeof *b); }
+            b[nb++] = (SBlock){(uint32_t)strtoul(p + 7, NULL, 10), next, next, -1};
+        } else if (nb) {
+            b[nb - 1].hi = next;
+        }
+        p = next;
+    }
+    #define SFAIL do { free(b); return NULL; } while (0)
+    int *jt = malloc(sizeof(int) * 8192), njt = 0, *js = malloc(sizeof(int) * 8192);  // jump target / source block
+    for (int k = 0; k < nb; k++) {
+        for (const char *l = b[k].lo; l < b[k].hi;) {
+            const char *nl = memchr(l, '\n', (size_t)(b[k].hi - l));
+            size_t n = nl ? (size_t)(nl - l) + 1 : (size_t)(b[k].hi - l);
+            const char *j = mem_find(l, n, "pc = ");
+            bool ex = mem_find(l, n, "exit_now = true; break;") != NULL;
+            if (j) {
+                char *end;
+                uint32_t t = (uint32_t)strtoul(j + 5, &end, 10);
+                if (strncmp(end, "u; continue;", 12)) { free(jt); free(js); SFAIL; }
+                int ti = -1;
+                for (int q = 0; q < nb; q++) if (b[q].pc == t) { ti = q; break; }
+                if (ti < 0 || njt == 8192) { free(jt); free(js); SFAIL; }
+                jt[njt] = ti; js[njt++] = k;
+            } else if (!ex && (mem_find(l, n, "break;") || mem_find(l, n, "continue;"))) {
+                free(jt); free(js); SFAIL;  // (a break / continue of the body's own: our breaks would mean something else)
+            }
+            l += n;
+        }
+    }
+    for (int i = 0; i < njt; i++)  // back edges -> loops [target, source], one per header (the widest)
+        if (jt[i] <= js[i] && b[jt[i]].loop_end < js[i]) b[jt[i]].loop_end = js[i];
+    bool ok = true;
+    for (int h = 0; h < nb && ok; h++) {
+        int e = b[h].loop_end;
+        if (e < 0) continue;
+        for (int h2 = h + 1; h2 <= e && ok; h2++)  // loops nest: one starting inside ends inside
+            if (b[h2].loop_end > e) ok = false;
+        for (int i = 0; i < njt && ok; i++)  // entered through the header only
+            if (jt[i] > h && jt[i] <= e && (js[i] < h || js[i] > e)) ok = false;
+    }
+    free(jt); free(js);
+    if (!ok) SFAIL;
+    #undef SFAIL
+    Str o = {0};
+    for (int k = 0; k < nb; k++) sp(&o, "  bool b_%u = %s;\n", b[k].pc, k == 0 ? "true" : "false");
+    struct_emit(&o, b, nb, 0, nb - 1, -1);
+    free(b);
+    return o.buf;
+}
+
 typedef struct {
     const uint8_t *code;   // first instruction group
     size_t ninsts;         // number of 8-byte words to scan
@@ -2359,7 +2474,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
-    if (any_branch) {
+    char *structured = any_branch ? structurize(body.buf) : NULL;
+    if (structured) {  // [XCDE] plain ifs / loops instead of the state machine (structurize above)
+        sp(&s, "%s", structured);
+        free(structured);
+    } else if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
         sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
