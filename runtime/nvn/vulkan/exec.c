@@ -151,6 +151,13 @@ uint64_t vk_completed_seq(void) {
     VK_CHECK(vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v));  // [XCDE] T128 (upstream #127): not an unusable value
     return v;
 }
+// [XCDE] (overlap wait mode, from the page fault handler) sleeps until the timeline reaches seq - submitted work only
+// (vk_ov_frame clamps the frame's sequence to the last submission). Gives up on any error: the caller re-checks.
+static void vk_block_seq(uint64_t seq) {
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                              .pValues = &seq};
+    while (vkWaitSemaphores(g_vk.dev, &wi, 100000000ull) == VK_TIMEOUT) {}
+}
 
 // (LARECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
 static __thread const char *wait_why;
@@ -4794,6 +4801,7 @@ void vk_ov_frame(uint64_t seq) {
         // (the frame is already on the GPU's timeline: the worker submits after every fence in wait mode, CMD_FENCE_SYNC;
         // an access must never wait for unsubmitted work)
         plat_ov_set_gpu_done(vk_completed_seq);
+        plat_ov_set_gpu_wait(vk_block_seq);
         if (seq > submit_seq) seq = submit_seq;
     }
     pthread_mutex_lock(&ov_lock);

@@ -37,6 +37,7 @@ int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 void plat_ov_protect(const uint64_t *lo, const uint64_t *hi, const uint8_t *gpu_writes, int n, uint64_t seq);  // seq 0: stats
 void plat_ov_release_prev(void);                       // (wait mode) the previous frame's GPU work is done
 void plat_ov_set_gpu_done(uint64_t (*fn)(void));       // the timeline's completed sequence (wait mode)
+void plat_ov_set_gpu_wait(void (*fn)(uint64_t seq));   // blocks until the timeline reaches seq (wait mode; else a yield loop)
 void plat_ov_frame_start(void);                        // the CPU starts its next frame now (fault times count from here)
 void plat_ov_guest_write(uint64_t addr, uint64_t size);  // a syscall is about to write guest memory: open those pages
 void plat_ov_set_worker(void);                         // the calling thread is the render worker

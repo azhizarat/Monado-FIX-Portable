@@ -215,6 +215,7 @@ typedef struct { uint64_t lo[OV_MAX], hi[OV_MAX]; uint8_t w[OV_MAX]; int n; uint
 static OvSet ov_sets[3];
 static OvSet *volatile ov_cur, *volatile ov_prev;
 static uint64_t (*volatile ov_gpu_done)(void);
+static void (*volatile ov_gpu_wait)(uint64_t);
 static volatile uint64_t ov_t0;  // CLOCK_MONOTONIC ns of the CPU's frame start
 static volatile pid_t ov_worker;
 // counters: [gpu-writes page? 1:0][cpu write? 1:0][worker? 1:0][time bucket: <4, 4-10, 10-17, >=17 ms]
@@ -242,7 +243,11 @@ static bool ov_fault(uint64_t fa, bool write) {
     __atomic_add_fetch(&ov_cnt[o->w[r]][write][gettid() == ov_worker][bk], 1, __ATOMIC_RELAXED);
     uint64_t (*done)(void) = ov_gpu_done;
     if (o->seq && done && done() < o->seq) {  // wait mode: until the GPU has finished that frame
-        while (done() < o->seq) sched_yield();
+        // [XCDE] perf: a blocking wait on the timeline. The yield loop kept a core busy for the whole wait - power the
+        // Deck's shared 15 W budget then took from the GPU clock.
+        void (*wait)(uint64_t) = ov_gpu_wait;
+        if (wait) wait(o->seq);
+        while (done() < o->seq) sched_yield();  // (no wait function, or it gave up)
         __atomic_add_fetch(&ov_waits, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&ov_wait_ns, ov_now() - t, __ATOMIC_RELAXED);
     }
@@ -263,6 +268,7 @@ static void ov_open_except(const OvSet *o, const OvSet *keep) {
     }
 }
 void plat_ov_set_gpu_done(uint64_t (*fn)(void)) { ov_gpu_done = fn; }
+void plat_ov_set_gpu_wait(void (*fn)(uint64_t seq)) { ov_gpu_wait = fn; }
 // the previous frame's GPU work is done: its pages open, except those the current frame protects
 void plat_ov_release_prev(void) {
     OvSet *p = ov_prev;

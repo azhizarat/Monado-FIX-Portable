@@ -2280,6 +2280,21 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
     }
 }
 
+// Maxwell semantics: saturate(NaN) = 0, FMNMX returns the non-NaN operand. [XCDE] perf: GPUs give that without explicit
+// checks - min / max return the non-NaN operand (AMD v_min / v_max, NVIDIA FMNMX, LLVM minnum on lavapipe) and
+// clamp(NaN, 0, 1) is max then min: 0. The checks were ~8-10 % of the instructions of the heaviest Colony 9 shaders
+// (ACO: a v_cmp and a v_cndmask per check). XCDE_NAN_EXACT=1: the explicit checks, as before.
+static const char glsl_nan_fast[] =
+    "float saturate(float x) { return clamp(x, 0.0f, 1.0f); }\n"
+    "vec2 saturate(vec2 x) { return clamp(x, vec2(0.0f), vec2(1.0f)); }\n"
+    "float fmin(float a, float b) { return min(a, b); }\n"
+    "float fmax(float a, float b) { return max(a, b); }\n";
+static const char glsl_nan_exact[] =
+    "float saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
+    "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
+    "float fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
+    "float fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n";
+
 static const char glsl_prelude[] =
     "#version 460\n"
     "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n"
@@ -2300,11 +2315,7 @@ static const char glsl_prelude[] =
     "int sx8(int v) { return bitfieldExtract(v, 0, 8); }\n"
     "int sx16(uint v) { return bitfieldExtract(int(v), 0, 16); }\n"
     "int sx16(int v) { return bitfieldExtract(v, 0, 16); }\n"
-    // MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand
-    "float saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
-    "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
-    "float fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
-    "float fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
+    // (saturate / fmin / fmax: glsl_nan_fast / glsl_nan_exact, after this)
     "uint clz(uint v) { return v == 0u ? 32u : uint(31 - findMSB(v)); }\n"
     "uint popcount(uint v) { return uint(bitCount(v)); }\n"
     "uint mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
@@ -2370,6 +2381,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         } else {
             sp(&s, "%s", glsl_prelude);
         }
+        static int exact = -1;
+        if (exact < 0) { const char *e = getenv("XCDE_NAN_EXACT"); exact = e && atoi(e) != 0; }
+        sp(&s, "%s", exact ? glsl_nan_exact : glsl_nan_fast);
     }
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
