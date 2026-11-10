@@ -438,11 +438,15 @@ static void create_device(void) {
         if (tmp_frame_gen_wanted()) {
 #define FREE(i) (used[i] < qp[i].queueCount && used[i] < 16)
 #define HAS(i, b) ((qp[i].queueFlags & (b)) == (b))
-            for (uint32_t i = 0; i < nf && fam[0] == UINT32_MAX; i++) {
-                VkBool32 pr = VK_FALSE;
-                vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &pr);
-                if (pr && HAS(i, VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) && FREE(i)) fam[0] = i, idx[0] = used[i]++;
-            }
+            // [XCDE] a present-capable compute queue too (pass 1): the Steam Deck's graphics family has one queue (the game's),
+            // and RADV presents from its compute queues - frame generation was always off there ("no free queues")
+            for (int pass = 0; pass < 2 && fam[0] == UINT32_MAX; pass++)
+                for (uint32_t i = 0; i < nf && fam[0] == UINT32_MAX; i++) {
+                    VkBool32 pr = VK_FALSE;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &pr);
+                    if (pr && HAS(i, pass == 0 ? VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT : VK_QUEUE_COMPUTE_BIT) && FREE(i))
+                        fam[0] = i, idx[0] = used[i]++;
+                }
             for (int pass = 0; pass < 3 && fam[1] == UINT32_MAX; pass++)
                 for (uint32_t i = 0; i < nf && fam[1] == UINT32_MAX; i++) {
                     bool ok = pass == 0 ? !(qp[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT))
