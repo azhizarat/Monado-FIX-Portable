@@ -1450,7 +1450,8 @@ const char *renderer_stats(void) {
 // to touch it, by st_defaults and by vk_exec_reset) and of the render pass (begin_pass): a draw with the same program,
 // topology class and both generations as the previous one reuses its pipeline without building and hashing the key.
 static uint32_t g_pipe_state_gen, g_pass_gen, g_pipe_bump_op;  // (g_pipe_bump_op: the command that last bumped it, XCDE_MEMO_WHY)
-static uint32_t g_tex_bind_gen[6], g_sbuf_bind_gen[6];  // ([XCDE] g_sbuf_bind_gen: CMD_BIND_STORAGE_BUFFERS, cbuf_info memo)  // [XCDE] per stage: bumped by CMD_BIND_TEXTURES (and st_defaults / vk_exec_reset)
+static uint32_t g_tex_bind_gen[6], g_sbuf_bind_gen[6], g_img_bind_gen;  // (g_img_bind_gen: CMD_BIND_IMAGES, draw_ texture-loop memos)
+  // ([XCDE] g_sbuf_bind_gen: CMD_BIND_STORAGE_BUFFERS, cbuf_info memo)  // [XCDE] per stage: bumped by CMD_BIND_TEXTURES (and st_defaults / vk_exec_reset)
 static bool cmd_keeps_pipe_key(uint32_t op) {
     switch (op) {
     case CMD_END: case CMD_JUMP: case CMD_CALL: case CMD_BIND_DEPTH_STENCIL: case CMD_BIND_VERTEX_BUFFERS:
@@ -1472,6 +1473,7 @@ static bool cmd_keeps_pipe_key(uint32_t op) {
 static void st_defaults(void) {
     g_pipe_state_gen++;
     for (int i = 0; i < 6; i++) g_tex_bind_gen[i]++, g_sbuf_bind_gen[i]++;
+    g_img_bind_gen++;
     memset(&st, 0, sizeof st);
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
@@ -5285,6 +5287,7 @@ static int g_cs_n;  // (compute program table below)
 void vk_exec_reset(void) {
     g_pipe_state_gen++; g_pass_gen++;
     for (int i = 0; i < 6; i++) g_tex_bind_gen[i]++, g_sbuf_bind_gen[i]++;
+    g_img_bind_gen++;
     memset(descriptor_cache,0,sizeof descriptor_cache);
     memset(gpu_frames,0,sizeof gpu_frames); gpu_last_tag=0; gpu_last_ms=-1;
     for (int i=0;i<SUBS;i++) subs[i].ts=subs[i].upload_ts=false;
@@ -5508,12 +5511,30 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         } else if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
             bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
-            memset(rs, 0, sizeof rs);
-            rs[0][0] = rs[0][1] = 1;
-            if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
-            rs[65][0] = g_mirror_w;
-            for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; rs[1 + t][2] = tex_d16[sg][t]; }
-            bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
+            // [XCDE] perf: only the rows this shader reads - row 0, one per texture (1 + t), row 65 (mirror) - are built and
+            // compared with the stage's previous table (was a 1 KB clear, fill and compare per stage per draw). A new table
+            // is a fresh 1 KB copy, zeros elsewhere as before. XCDE_RSCALE_FULL=1: the whole table every time.
+            static int full = -1;
+            if (full < 0) full = getenv("XCDE_RSCALE_FULL") && atoi(getenv("XCDE_RSCALE_FULL")) != 0;
+            int nr = 1 + (si->ntex < 64 ? si->ntex : 64);
+            float r0[4] = {1, 1, 0, 0};
+            if (rscale_row0) memcpy(r0, rscale_row0, 16);
+            static struct { uint64_t seq; int nr; float rows[65][4]; float mirror; VkSpan span; bool valid; } last[2];
+            typeof(last[0]) *L = &last[sg];
+            bool same = !full && L->valid && L->seq == vk_pending_seq() && L->nr == nr && L->mirror == g_mirror_w &&
+                        !memcmp(L->rows[0], r0, 16);
+            for (int t = 0; same && t < nr - 1; t++)
+                same = L->rows[1 + t][0] == tex_sc[sg][t][0] && L->rows[1 + t][1] == tex_sc[sg][t][1] && L->rows[1 + t][2] == tex_d16[sg][t];
+            if (!same) {
+                memset(rs, 0, sizeof rs);
+                memcpy(rs[0], r0, 16);
+                rs[65][0] = g_mirror_w;
+                for (int t = 0; t < nr - 1; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; rs[1 + t][2] = tex_d16[sg][t]; }
+                L->span = vk_transient_copy(rs, sizeof rs, 256);
+                L->seq = vk_pending_seq(); L->nr = nr; L->mirror = g_mirror_w; L->valid = true;
+                memcpy(L->rows, rs, (size_t)nr * 16);
+            }
+            bi[n] = ubo_span(L->span, sizeof rs);
         } else {
             float zero[8] = {0};
             bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
@@ -6053,6 +6074,24 @@ static bool tmp_invfix_patch(int idx, uint64_t addr, uint64_t size, VkDescriptor
     *out = ubo_span(s, size);
     return true;
 }
+// [XCDE] perf: draw_'s loops over the draw's textures (storage upgrade T192, hazard T162, read epochs) chase pointers
+// texture -> pool entry -> backend and missed the cache on every draw (~25 % of draw_'s own time, measured). Most draws
+// repeat the previous one's program and textures: the loops are skipped when nothing they read changed - the program,
+// the texture / image bindings and pool, the pool's descriptors and the views (image re-creations), and for the epoch
+// loops the pass and its barrier epoch. XCDE_TEXLOOP_MEMO=0: off.
+typedef struct { const void *pr, *tpool; uint32_t tb[3], ib, desc, vgen; } TexLoopKey;
+static TexLoopKey texloop_key(const void *pr) {
+    extern uint32_t vk_view_gen;
+    TexLoopKey k = {pr, st.tpool, {g_tex_bind_gen[0], g_tex_bind_gen[1], g_tex_bind_gen[2]}, g_img_bind_gen,
+                    atomic_load_explicit(&g_tex_desc_gen, memory_order_relaxed), vk_view_gen};
+    return k;
+}
+static bool hz_valid;  // (draw_ hazard-loop memo; cleared when a draw marks a storage image written)
+static int texloop_memo_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XCDE_TEXLOOP_MEMO"); on = !(e && atoi(e) == 0); }
+    return on;
+}
 static uint64_t prof_tp_;
 // [XCDE] (skinning / overlap study) XCDE_SKIN_TRACE=<presented frame> (0: the frame after build/skin_now appears):
 // that frame's memory-writing draws ("W": storage buffers bound to the storing stages, transform feedback range), the
@@ -6230,7 +6269,10 @@ static void draw_(CmdRec *r, bool indexed) {
     if (ct_on()) ct_draw(pr, "draw");
     PRE_MARK(1);
     alias_draw_check();
-    {   // [XCDE] T192: a texture used through SULD / SUST without storage usage yet gets it (re-created, contents copied)
+    TexLoopKey tlk = texloop_key(pr);
+    static TexLoopKey t192_done;  // (the last key the storage loop ran for: it only upgrades once per texture)
+    bool t192_skip = texloop_memo_on() && !naliases && !memcmp(&t192_done, &tlk, sizeof tlk);
+    if (!t192_skip) {   // [XCDE] T192: a texture used through SULD / SUST without storage usage yet gets it (re-created, contents copied)
         ShaderInfo *sis[3] = {pr->vi, pr->fi, pr->gi};
         for (int s = 0; s < 3; s++)
             for (int i = 0; sis[s] && i < sis[s]->ntex; i++) {
@@ -6245,6 +6287,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 vk_end_pass(); RT_DIRTY();
                 vk_tex_add_storage(t, vk_cmd());
             }
+        t192_done = texloop_key(pr);  // (after: an upgrade re-created images and moved vk_view_gen)
     }
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
@@ -6279,7 +6322,11 @@ static void draw_(CmdRec *r, bool indexed) {
         // attachment of the pass it continues: the feedback case, read in place as before)
         bool cont = in_pass && !st.rt_dirty;
         ShaderInfo *sis[3] = {pr->vi, pr->fi, pr->gi};
-        for (int s = 0; s < 3 && !pass_hazard; s++) {
+        // (memo: the same textures in the same pass behind the same barrier were found hazard-free by the previous draw)
+        static TexLoopKey hz_k; static uint64_t hz_seq; static uint32_t hz_epoch;
+        TexLoopKey hk = texloop_key(pr);
+        bool hz_skip = texloop_memo_on() && cont && hz_valid && hz_seq == pass_seq_no && hz_epoch == pass_epoch && !memcmp(&hz_k, &hk, sizeof hk);
+        for (int s = 0; s < 3 && !pass_hazard && !hz_skip; s++) {
             ShaderInfo *si = sis[s];
             if (!si) continue;
             for (int i = 0; i < si->ntex && !pass_hazard; i++) {
@@ -6291,6 +6338,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (cont) RT_DIRTY();  // (restart the pass behind a full barrier)
             }
         }
+        hz_valid = cont && !pass_hazard; hz_k = hk; hz_seq = pass_seq_no; hz_epoch = pass_epoch;
     }
     {   // [XCDE] T220: the pass that composites the scene into the presented image can go on with the HUD in the same
         // pass (the title screen: composite, then "Press any button" / the copyright as instanced glyphs). The image
@@ -6317,7 +6365,11 @@ static void draw_(CmdRec *r, bool indexed) {
     if (simg) pass_dirty = true;
     {   // [XCDE] T162: what this draw samples, as of this epoch (a later pass writing it must wait for the reads)
         ShaderInfo *sis[3] = {pr->vi, pr->fi, pr->gi};
-        for (int s = 0; s < 3; s++) {
+        static TexLoopKey re_k; static uint32_t re_epoch; static bool re_valid;  // (memo: these textures already carry this epoch)
+        TexLoopKey rk = texloop_key(pr);
+        bool re_skip = texloop_memo_on() && re_valid && re_epoch == pass_epoch && !memcmp(&re_k, &rk, sizeof rk);
+        re_valid = true; re_k = rk; re_epoch = pass_epoch;
+        for (int s = 0; s < 3 && !re_skip; s++) {
             ShaderInfo *si = sis[s];
             if (!si) continue;
             for (int i = 0; i < si->ntex; i++) {
@@ -6326,7 +6378,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 ((TexBackend *)t->backend)->r_epoch = pass_epoch;
                 // [XCDE] T162: a storage image (SULD / SUST) counts as written too: whatever reads or writes it next
                 // (sampling, another image draw, an attachment) gets a graphics barrier first
-                if (si->tex[i].is_image) ((TexBackend *)t->backend)->w_epoch = pass_epoch;
+                if (si->tex[i].is_image) { ((TexBackend *)t->backend)->w_epoch = pass_epoch; hz_valid = false; re_valid = false; }
             }
         }
     }
@@ -7855,7 +7907,10 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
-                memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (memcmp(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8)) {  // [XCDE] (draw_ texture-loop memos: on a change)
+                    memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                    g_img_bind_gen++;
+                }
             break;
         case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
         case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
