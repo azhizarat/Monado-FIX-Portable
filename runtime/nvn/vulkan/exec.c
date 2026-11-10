@@ -5792,6 +5792,7 @@ static bool tmp_dm1 = true;          // the scene draws' NVN depth mode (clip z 
 // found per program; XCDE_TMP_INVFIX_YSIGN=-1: the other y sign (tests).
 static struct { bool on; int idx; uint32_t off; float jx, jy; } g_invfix;  // (cbuf_info, vertex stage: patch buffer idx at off)
 static bool tmp_flip_y;  // the scene draws' vertex output y flip (translate.c: gl_Position.y = -y)
+static uint64_t tmp_cam_frame = ~0ull;  // the last presented frame the scene camera was found in
 static bool invfix_is_inverse(const float *m, const float *a) {  // rows: m x a = identity
     for (int i = 0; i < 16; i++) if (!(m[i] == m[i]) || fabsf(m[i]) > 1e30f) return false;
     for (int i = 0; i < 4; i++)
@@ -5841,6 +5842,51 @@ static bool invfix_find(int *idx, uint32_t *off) {
     *idx = e->idx; *off = e->off;
     return true;
 }
+// [XCDE] (tmp_draw) jitter-consistent screen passes (see invfix_find) and the XCDE_TMP_JTRACE diagnostics; for draws
+// with or without a depth target (a lighting pass may have none)
+static void tmp_screen_pass(const Prog *pr, float *jx, float *jy, int nojit) {
+    uint64_t fr = renderer_present_count();
+    g_invfix.on = false;
+    {   int ix; uint32_t io;  // [XCDE] (jitter-consistent screen passes, above) no viewport jitter; the inverse matrix takes it
+        if (!nojit && !tmp_hud_started() && tmp_frame == fr && invfix_find(&ix, &io)) {
+            *jx = *jy = 0;
+            static float ysign = 0;
+            if (ysign == 0) { const char *e = getenv("XCDE_TMP_INVFIX_YSIGN"); ysign = e && atoi(e) < 0 ? -1.0f : 1.0f; }
+            // the scene draws' jitter in guest clip units: x right = +2 jx / width; y: the viewport is flipped (set_viewport),
+            // so +jy pixels down is -2 jy / height in Vulkan NDC, the negative of that in the guest's when its output is flipped
+            TexBackend *db = tmp_depth_tex->backend;
+            float w = (float)(db && db->width ? db->width : 1), h = (float)(db && db->height ? db->height : 1);
+            g_invfix.on = true; g_invfix.idx = ix; g_invfix.off = io;
+            g_invfix.jx = 2.0f * tmp_jit[0] / w;
+            g_invfix.jy = ysign * (tmp_flip_y ? 2.0f : -2.0f) * tmp_jit[1] / h;
+        }
+    }
+    {   // [XCDE] (diagnostics) XCDE_TMP_JTRACE=1: once build/jtrace_now appears, one frame's draws that read a scene-sized
+        // texture (the G-buffer, the scene depth): jittered or not, fixed by the inverse matrix or not, gl_FragCoord used
+        static int on = -1; static uint64_t at, polled;
+        if (on < 0) on = getenv("XCDE_TMP_JTRACE") ? atoi(getenv("XCDE_TMP_JTRACE")) : 0;  // (2: every draw)
+        if (on && fr >= polled + 30) { polled = fr; if (!remove("build/jtrace_now")) at = fr + 1; }
+        if (on && at && fr == at && tmp_depth_tex && st.program) {
+            int nscene = 0;
+            const ShaderInfo *fi = pr->fi;
+            for (int i = 0; fi && i < fi->ntex && i < 32; i++) {
+                NvnTexture *t = shader_texture_object(1, (ShaderTexture *)&fi->tex[i]);
+                if (t && t->width == tmp_depth_tex->width && t->height == tmp_depth_tex->height) nscene++;
+            }
+            if (nscene || on == 2) {
+                NvnTexture *c0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+                TexBackend *dbk = st.rt.depth ? st.rt.depth->backend : NULL, *sbk = tmp_depth_tex->backend;
+                LOG("[jtrace] vs %016llx fs %016llx: %s%s, %d scene-sized textures, fragcoord %d, depth %s test %d, rt %ux%u fmt %#x%s%s cam %d\n",
+                    (unsigned long long)st.program->stages[0].code_hash, (unsigned long long)st.program->stages[1].code_hash,
+                    (*jx != 0 || *jy != 0) ? "JITTERED" : "not jittered", g_invfix.on ? " +invfix" : "", nscene,
+                    fi && fi->msl ? strstr(fi->msl, "gl_FragCoord") != NULL : -1, st.rt.depth ? "yes" : "no", st.ds[0],
+                    c0 ? c0->width : 0, c0 ? c0->height : 0, c0 ? c0->format : 0,
+                    !st.rt.depth ? "" : dbk && sbk && dbk->image == sbk->image ? " (scene depth)" : " (other depth)",
+                    c0 && renderer_texture_presented(c0) ? " PRESENTED" : "", (int)tmp_cam.ok);
+            }
+        }
+    }
+}
 static void tmp_draw(const Prog *pr, float *jx, float *jy) {
     uint64_t fr = renderer_present_count();
     if (fr != tmp_frame) {
@@ -5848,12 +5894,17 @@ static void tmp_draw(const Prog *pr, float *jx, float *jy) {
         tmp_cam.ok = false;
         tmp_jitter(tmp_jit);
     }
-    if (!st.rt.depth) return;
+    if (!st.rt.depth) {
+        static int nojit0 = -1;
+        if (nojit0 < 0) nojit0 = getenv("XCDE_TMP_NOJITTER") != NULL;
+        tmp_screen_pass(pr, jx, jy, nojit0);
+        return;
+    }
     if (!tmp_cam.ok)
         for (int k = 0; k < 14; k++) {
             const Range *u = &st.ubuf[0][k];
             if (u->addr < HEAP_BASE || u->size < 176) continue;
-            if (tmp_cam_check((const float *)(uintptr_t)u->addr, &tmp_cam)) { tmp_depth_tex = st.rt.depth; tmp_dm1 = pr->vkey.depth_minus_one; tmp_flip_y = pr->vkey.flip_y; break; }
+            if (tmp_cam_check((const float *)(uintptr_t)u->addr, &tmp_cam)) { tmp_depth_tex = st.rt.depth; tmp_dm1 = pr->vkey.depth_minus_one; tmp_flip_y = pr->vkey.flip_y; tmp_cam_frame = fr; break; }
         }
     // (the same image: the game draws its prepass and colour passes through different texture objects over one depth)
     TexBackend *db = st.rt.depth->backend, *sb = tmp_depth_tex ? tmp_depth_tex->backend : NULL;
@@ -5882,22 +5933,16 @@ static void tmp_draw(const Prog *pr, float *jx, float *jy) {
             }
         }
     }
-    if (scene && world && !nojit && !tmp_hud_started()) { *jx = tmp_jit[0]; *jy = tmp_jit[1]; tmp_scene_frame = fr; }
-    g_invfix.on = false;
-    {   int ix; uint32_t io;  // [XCDE] (jitter-consistent screen passes, above) no viewport jitter; the inverse matrix takes it
-        if (!nojit && !tmp_hud_started() && tmp_frame == fr && invfix_find(&ix, &io)) {
-            *jx = *jy = 0;
-            static float ysign = 0;
-            if (ysign == 0) { const char *e = getenv("XCDE_TMP_INVFIX_YSIGN"); ysign = e && atoi(e) < 0 ? -1.0f : 1.0f; }
-            // the scene draws' jitter in guest clip units: x right = +2 jx / width; y: the viewport is flipped (set_viewport),
-            // so +jy pixels down is -2 jy / height in Vulkan NDC, the negative of that in the guest's when its output is flipped
-            TexBackend *db = tmp_depth_tex->backend;
-            float w = (float)(db && db->width ? db->width : 1), h = (float)(db && db->height ? db->height : 1);
-            g_invfix.on = true; g_invfix.idx = ix; g_invfix.off = io;
-            g_invfix.jx = 2.0f * tmp_jit[0] / w;
-            g_invfix.jy = ysign * (tmp_flip_y ? 2.0f : -2.0f) * tmp_jit[1] / h;
-        }
-    }
+    // [XCDE] only while the upscaler runs: the camera seen this frame or the previous one (the prepass draws before it is
+    // seen). Menus and the title screen without the scene camera were jittered too and went to FSR 1 - which keeps the
+    // jitter: the image shook (user: "logo no menu").
+    bool cam_recent = tmp_cam.ok || (tmp_cam_frame != ~0ull && tmp_cam_frame + 1 >= fr);
+    // [XCDE] nothing drawn into the presented image is jittered: there only the scene composite (a screen pass reading the
+    // already jittered scene - jittered again, the scene moved twice the offset and FSR 3 took back only one: the title
+    // menu's sword, sky and text shook) and the HUD go. The title menu's composite tests a depth of the scene's size.
+    bool presented = st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0]);
+    if (scene && world && !nojit && !tmp_hud_started() && cam_recent && !presented) { *jx = tmp_jit[0]; *jy = tmp_jit[1]; tmp_scene_frame = fr; }
+    tmp_screen_pass(pr, jx, jy, nojit);
     if (getenv("XCDE_TMP_LOG")) {  // (debugging) per frame: draws jittered / scene draws not jittered (after the HUD began) / others
         static uint64_t fr; static int nj, nh, no, nl;
         if (fr != renderer_present_count()) {
