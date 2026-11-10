@@ -695,6 +695,9 @@ VkImageView tmp_upscale(VkCommandBuffer cb, TexBackend *color, VkImageView color
         LOG("[tmp] %ux%u -> %ux%u jitter %.3f %.3f (%u phases) %s%s near %.3f fov %.1f proj11 %.3f\n", rw, rh, ow, oh, jitter[0],
             jitter[1], jit_phases, reset ? "reset " : "", ok ? "ok" : "FAILED", cam->proj[11] * 0.5, 2 * atan(1.0 / cam->proj[5]) * 57.2958,
             cam->proj[5]);
+    if (env_int("XCDE_TMP_PROJLOG") && (frames % 2) == 0 && frames < 400)  // (research) the game's own projection offsets (its TAA jitter?)
+        LOG("[tmp] proj row0 %.6f %.6f %.6f %.6f row1 %.6f %.6f %.6f %.6f (in render px: %.3f %.3f)\n", cam->proj[0], cam->proj[1], cam->proj[2],
+            cam->proj[3], cam->proj[4], cam->proj[5], cam->proj[6], cam->proj[7], cam->proj[2] * rw * 0.5, cam->proj[6] * rh * 0.5);
     last_jit[0] = jitter[0]; last_jit[1] = jitter[1];
     prev = *cam;
     if (!ok) prev.ok = false;

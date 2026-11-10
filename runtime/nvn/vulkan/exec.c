@@ -5893,6 +5893,9 @@ static void tmp_draw(const Prog *pr, float *jx, float *jy) {
         tmp_frame = fr;
         tmp_cam.ok = false;
         tmp_jitter(tmp_jit);
+        static int nj = -1;  // (XCDE_TMP_NOJITTER: the upscaler must be told so - it removed a jitter that was never applied)
+        if (nj < 0) nj = getenv("XCDE_TMP_NOJITTER") != NULL;
+        if (nj) tmp_jit[0] = tmp_jit[1] = 0;
     }
     if (!st.rt.depth) {
         static int nojit0 = -1;
@@ -5941,7 +5944,10 @@ static void tmp_draw(const Prog *pr, float *jx, float *jy) {
     // already jittered scene - jittered again, the scene moved twice the offset and FSR 3 took back only one: the title
     // menu's sword, sky and text shook) and the HUD go. The title menu's composite tests a depth of the scene's size.
     bool presented = st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0]);
-    if (scene && world && !nojit && !tmp_hud_started() && cam_recent && !presented) { *jx = tmp_jit[0]; *jy = tmp_jit[1]; tmp_scene_frame = fr; }
+    if (scene && world && !tmp_hud_started() && cam_recent && !presented) {
+        tmp_scene_frame = fr;  // [XCDE] (the HUD snapshot needs this frame's scene even without jitter: the UI went into FSR - ghosting)
+        if (!nojit) { *jx = tmp_jit[0]; *jy = tmp_jit[1]; }
+    }
     tmp_screen_pass(pr, jx, jy, nojit);
     if (getenv("XCDE_TMP_LOG")) {  // (debugging) per frame: draws jittered / scene draws not jittered (after the HUD began) / others
         static uint64_t fr; static int nj, nh, no, nl;
